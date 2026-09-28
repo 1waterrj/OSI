@@ -906,6 +906,183 @@ def test_an_unattributed_formula_does_not_duplicate_another_formulas_id():
     assert len(ids) == len(set(ids)), f"duplicate formula ids on a plain round trip: {ids}"
 
 
+def test_an_unattributed_formulas_surfacing_column_keeps_its_own_name():
+    """An ATTRIBUTE column surfacing a cross-dataset formula whose own TML
+    `name` differs from the column's `name` must come back under the
+    column's name, not the formula's: `MODEL_STASH_UNATTRIBUTED_FORMULAS`
+    is the only record of that name once the column is gone.
+    """
+    def table(name, columns):
+        return TmlDocument(kind="table", guid=None, body={
+            "name": name, "db": "D", "schema": "S", "db_table": name,
+            "connection": {"name": "Conn"},
+            "columns": [{"name": c, "db_column_name": c.upper(),
+                         "db_column_properties": {"data_type": "DOUBLE"}} for c in columns]})
+    model = TmlDocument(kind="model", guid=None, body={
+        "name": "M", "model_tables": [{"name": "A"}, {"name": "B"}],
+        "formulas": [
+            {"id": "formula_internal", "name": "InternalCalc_v1", "expr": "[A::x] + [B::y]"},
+        ],
+        "columns": [
+            {"name": "Date2", "formula_id": "formula_internal",
+             "properties": {"column_type": "ATTRIBUTE"}},
+        ]})
+    ossie = tml_to_ossie.convert(DocumentSet(model=model, tables=(table("A", ["x"]), table("B", ["y"]))))
+    rebuilt = ossie_to_thoughtspot.convert(ossie.model).documents.model.body
+    column_names = [c["name"] for c in rebuilt["columns"]]
+    assert "Date2" in column_names
+    assert "InternalCalc_v1" not in column_names
+
+
+def test_an_unattributed_formulas_sibling_reference_still_resolves():
+    """kayemkim's review on PR #475: restoring the surfacing column under
+    its own display name (see the sibling test above) must not come at the
+    cost of a SECOND formula that references the unattributed one by its
+    original name. A formula's own name and the name of the column that
+    surfaces it are independent: the column comes back under its display
+    name ("Date2"), but a sibling's `[formula_internalcalc_v1]` reference
+    is written against the FORMULA's own name ("InternalCalc_v1") and must
+    keep resolving to it, not dangle silently.
+    """
+    def table(name, columns):
+        return TmlDocument(kind="table", guid=None, body={
+            "name": name, "db": "D", "schema": "S", "db_table": name,
+            "connection": {"name": "Conn"},
+            "columns": [{"name": c, "db_column_name": c.upper(),
+                         "db_column_properties": {"data_type": "DOUBLE"}} for c in columns]})
+    model = TmlDocument(kind="model", guid=None, body={
+        "name": "M", "model_tables": [{"name": "A"}, {"name": "B"}],
+        "formulas": [
+            {"id": "formula_internal", "name": "InternalCalc_v1", "expr": "[A::x] + [B::y]"},
+            {"id": "formula_doubled", "name": "Doubled", "expr": "[formula_internalcalc_v1] * 2"},
+        ],
+        "columns": [
+            {"name": "Date2", "formula_id": "formula_internal",
+             "properties": {"column_type": "ATTRIBUTE"}},
+            {"name": "Doubled", "formula_id": "formula_doubled",
+             "properties": {"column_type": "MEASURE"}},
+        ]})
+    ossie = tml_to_ossie.convert(DocumentSet(model=model, tables=(table("A", ["x"]), table("B", ["y"]))))
+    result = ossie_to_thoughtspot.convert(ossie.model)
+    rebuilt = result.documents.model.body
+
+    column_names = [c["name"] for c in rebuilt["columns"]]
+    assert "Date2" in column_names, "the #468 fix regressed: column not restored under its display name"
+
+    formulas_by_id = {f["id"]: f for f in rebuilt["formulas"]}
+    doubled = next(f for f in rebuilt["formulas"] if f["name"] == "Doubled")
+    referenced = re.search(r"\[(formula_[A-Za-z0-9_]+)\]", doubled["expr"])
+    assert referenced is not None, f"Doubled's reference was stripped entirely: {doubled['expr']!r}"
+    target = formulas_by_id.get(referenced.group(1))
+    assert target is not None and target["expr"] == "[A::x] + [B::y]", (
+        f"Doubled's reference no longer resolves to InternalCalc_v1's formula: {doubled['expr']!r}"
+    )
+    assert not any(i["code"] == "TS-MODEL-FORMULA-REFERENCE-UNRESOLVED" for i in result.issues.as_dicts())
+
+
+def test_an_unattributed_formula_id_collision_repoints_its_own_column():
+    """jbonofre's first inline comment on PR #475: `_allocate_formula_id` is
+    called with `columns_entry=None` for an unattributed formula (its
+    surfacing columns[] entry does not exist yet at that point), so its
+    "keep the column's formula_id in sync on a rename" half never runs, and
+    that has to happen by hand afterward, reading the id
+    `_allocate_formula_id` actually settled on rather than the
+    pre-allocation local it was minted from.
+
+    Two unattributed formulas whose OWN names normalise to the same id
+    ("Internal Calc" / "Internal-Calc", same pair `_formula_id_from`'s own
+    docstring uses) force `_allocate_formula_id` to rename the second one.
+    The second surfacing column must follow it to the renamed id, not be
+    left pointing at the first formula's id.
+    """
+    def table(name, columns):
+        return TmlDocument(kind="table", guid=None, body={
+            "name": name, "db": "D", "schema": "S", "db_table": name,
+            "connection": {"name": "Conn"},
+            "columns": [{"name": c, "db_column_name": c.upper(),
+                         "db_column_properties": {"data_type": "DOUBLE"}} for c in columns]})
+    model = TmlDocument(kind="model", guid=None, body={
+        "name": "M", "model_tables": [{"name": "A"}, {"name": "B"}],
+        "formulas": [
+            {"id": "formula_one", "name": "Internal Calc", "expr": "[A::x] + [B::y]"},
+            {"id": "formula_two", "name": "Internal-Calc", "expr": "[A::x] * [B::y]"},
+        ],
+        "columns": [
+            {"name": "Internal Calc", "formula_id": "formula_one",
+             "properties": {"column_type": "ATTRIBUTE"}},
+            {"name": "Internal-Calc", "formula_id": "formula_two",
+             "properties": {"column_type": "ATTRIBUTE"}},
+        ]})
+    ossie = tml_to_ossie.convert(DocumentSet(model=model, tables=(table("A", ["x"]), table("B", ["y"]))))
+    result = ossie_to_thoughtspot.convert(ossie.model)
+    rebuilt = result.documents.model.body
+
+    ids = [f["id"] for f in rebuilt["formulas"]]
+    assert len(ids) == len(set(ids)), f"duplicate formula ids: {ids}"
+    assert any(i["code"] == "TS-MODEL-FORMULA-ID-COLLISION" for i in result.issues.as_dicts())
+
+    formulas_by_id = {f["id"]: f for f in rebuilt["formulas"]}
+    second_column = next(c for c in rebuilt["columns"] if c["name"] == "Internal-Calc")
+    target = formulas_by_id.get(second_column["formula_id"])
+    assert target is not None, (
+        f"column {second_column['name']!r} points at formula_id "
+        f"{second_column['formula_id']!r}, which names no formula in this model"
+    )
+    assert target["expr"] == "[A::x] * [B::y]", (
+        f"column {second_column['name']!r} resolves to the WRONG formula "
+        f"({target['expr']!r}); it was left on the pre-collision id instead "
+        f"of following the rename"
+    )
+
+
+def test_an_unattributed_formula_names_display_name_collision_against_itself():
+    """jbonofre's second inline comment on PR #475: the formula-name
+    allocation's `object_ref` must name the FORMULA the collision happened
+    on (`formula_name_raw`), not the column that happens to surface it
+    (`raw_name`); the two are independent once a formula's own name is
+    stashed separately from its column's display name.
+
+    Two unattributed formulas surfaced under two distinct column names
+    ("ColA", "ColB") but sharing one formula name ("SameName") force the
+    SECOND formula's name allocation to collide with the first's. The
+    resulting TS-MODEL-DISPLAY-NAME-COLLISION must point at
+    `formula:SameName`, not at the second column's own name.
+    """
+    def table(name, columns):
+        return TmlDocument(kind="table", guid=None, body={
+            "name": name, "db": "D", "schema": "S", "db_table": name,
+            "connection": {"name": "Conn"},
+            "columns": [{"name": c, "db_column_name": c.upper(),
+                         "db_column_properties": {"data_type": "DOUBLE"}} for c in columns]})
+    model = TmlDocument(kind="model", guid=None, body={
+        "name": "M", "model_tables": [{"name": "A"}, {"name": "B"}],
+        "formulas": [
+            {"id": "formula_a", "name": "SameName", "expr": "[A::x] + [B::y]"},
+            {"id": "formula_b", "name": "SameName", "expr": "[A::x] * [B::y]"},
+        ],
+        "columns": [
+            {"name": "ColA", "formula_id": "formula_a",
+             "properties": {"column_type": "ATTRIBUTE"}},
+            {"name": "ColB", "formula_id": "formula_b",
+             "properties": {"column_type": "ATTRIBUTE"}},
+        ]})
+    ossie = tml_to_ossie.convert(DocumentSet(model=model, tables=(table("A", ["x"]), table("B", ["y"]))))
+    result = ossie_to_thoughtspot.convert(ossie.model)
+
+    collisions = [i for i in result.issues.as_dicts() if i["code"] == "TS-MODEL-DISPLAY-NAME-COLLISION"]
+    assert len(collisions) == 1, f"expected exactly one display-name collision, got: {collisions}"
+    assert collisions[0]["object_ref"] == "formula:SameName", (
+        f"collision logged against {collisions[0]['object_ref']!r}, which names "
+        f"a COLUMN, not the formula whose own name actually collided"
+    )
+
+    rebuilt = result.documents.model.body
+    column_names = {c["name"] for c in rebuilt["columns"]}
+    assert column_names == {"ColA", "ColB"}, (
+        "the formula-name collision must not rename either surfacing column"
+    )
+
+
 def test_every_referencing_join_carries_the_compulsory_with_field():
     """`with` is mandatory on every `model_tables[].joins[]` entry.
 

@@ -39,6 +39,7 @@ from ossie_thoughtspot.constants import (
     FIELD_STASH_COLUMN_PROPERTIES,
     FIELD_STASH_DATA_TYPE,
     FIELD_STASH_DB_COLUMN_NAME,
+    FIELD_STASH_FORMULA_NAME,
     MODEL_STASH_ACTION_OBJECT_ASSOCIATIONS,
     MODEL_STASH_COLUMN_GROUPS,
     MODEL_STASH_CONSTRAINTS,
@@ -520,6 +521,34 @@ class TestUnattributedFormulas:
         assert unattributed[0]["expr"] == expr
 
         assert any(i["code"] == "TS-FIELD-UNATTRIBUTED" for i in result.issues.as_dicts())
+
+    def test_the_column_display_name_is_stashed_not_the_formulas_own_name(self):
+        orders = _table("ORDERS", columns=[_column("Amount", "AMOUNT", "DOUBLE")])
+        customers = _table("CUSTOMERS", columns=[_column("Discount", "DISCOUNT", "DOUBLE")])
+        expr = "[ORDERS::Amount] - [CUSTOMERS::Discount]"
+        model = _model(
+            model_tables=[{"name": "ORDERS"}, {"name": "CUSTOMERS"}],
+            columns=[
+                _attribute("Amount", "ORDERS::Amount"),
+                _attribute("Discount", "CUSTOMERS::Discount"),
+                {"name": "Date2", "formula_id": "formula_internal",
+                 "properties": {"column_type": "ATTRIBUTE"}},
+            ],
+            formulas=[{"id": "formula_internal", "name": "InternalCalc_v1", "expr": expr}],
+        )
+
+        result = convert(_document_set(model, orders, customers))
+
+        model_stash = _own_stash(result.model)
+        unattributed = model_stash[MODEL_STASH_UNATTRIBUTED_FORMULAS]
+        assert len(unattributed) == 1
+        assert unattributed[0]["name"] == "Date2"
+        # The formula's own name is stashed too (kayemkim's review on PR
+        # #475): the column's display name alone is not enough for the
+        # return leg to keep a sibling formula's cross-reference to this
+        # formula resolvable: that reference is written against the
+        # formula's own name, not the column's.
+        assert unattributed[0][FIELD_STASH_FORMULA_NAME] == "InternalCalc_v1"
 
 
 class TestStashProtocol:
