@@ -98,6 +98,7 @@ class Concept:
     _derived_by: list[Formula]
     _requires: list[Formula]
     _is_component: bool
+    _iri: str | None
 
     def __init__(
         self,
@@ -109,7 +110,8 @@ class Concept:
         identify_by: dict[str, Relationship] | None = None,
         derived_by: list[Formula] | None = None,
         requires: list[Formula] | None = None,
-        is_component: bool = True
+        is_component: bool = True,
+        iri: str | None = None,
     ):
         self._name = name
         self._type = type
@@ -120,6 +122,7 @@ class Concept:
         self._derived_by = derived_by if derived_by else []
         self._requires = requires if requires else []
         self._is_component = is_component
+        self._iri = iri
 
     def add_require(self, require: Formula) -> None:
         self._requires.append(require)
@@ -144,6 +147,10 @@ class Concept:
     @property
     def description(self) -> str | None:
         return self._description
+
+    @property
+    def iri(self) -> str | None:
+        return self._iri
 
     @property
     def is_builtin(self) -> bool:
@@ -207,6 +214,7 @@ class Relationship:
     _multiplicity: RelationshipMultiplicity | None
     _derived_by: list[Formula]
     _requires: list[Formula]
+    _iri: str | None
 
     def __init__(
         self,
@@ -216,6 +224,7 @@ class Relationship:
         description: str | None = None,
         verbalizes: list[str] | None = None,
         multiplicity: RelationshipMultiplicity | None = None,
+        iri: str | None = None,
     ):
         self._name = name
         self._container = container
@@ -228,6 +237,7 @@ class Relationship:
         self._verbalizations = parse_verbalizations(self, verbalizes)
         self._derived_by = []
         self._requires = []
+        self._iri = iri
 
     @property
     def name(self) -> str:
@@ -244,6 +254,10 @@ class Relationship:
     @property
     def description(self) -> str | None:
         return self._description
+
+    @property
+    def iri(self) -> str | None:
+        return self._iri
 
     @property
     def signature(self) -> list[Concept]:
@@ -1016,6 +1030,7 @@ class OssieOntology:
     _ontology: OntologyComponent
     _ontology_mappings: list[OntologyMapping]
     _ontology_mapping_index: dict[str, OntologyMapping]
+    _prefixes: dict[str, str]
 
     def __init__(
         self,
@@ -1024,6 +1039,7 @@ class OssieOntology:
         description: str | None = None,
         ai_context: AiContext | None = None,
         version: str | None = None,
+        prefixes: dict[str, str] | None = None,
     ):
         self._name = name
         self._description = description
@@ -1032,6 +1048,7 @@ class OssieOntology:
         self._ontology = ontology
         self._ontology_mappings = []
         self._ontology_mapping_index = {}
+        self._prefixes = dict(prefixes) if prefixes else {}
 
     @property
     def name(self) -> str:
@@ -1062,6 +1079,11 @@ class OssieOntology:
     @property
     def ontology_mappings(self) -> list[OntologyMapping]:
         return list(self._ontology_mappings)
+
+    @property
+    def prefixes(self) -> dict[str, str]:
+        """Namespace prefixes the document's QName `iri` values resolve against."""
+        return dict(self._prefixes)
 
 
 # ---------------------------------------------------------------------------
