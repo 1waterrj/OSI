@@ -1104,6 +1104,63 @@ class TestUnnormalisableNamesAreCaughtNotFatal:
         assert fields[0]["label"] == "名前"
 
 
+class TestModelNameMalformed:
+    """The model-scope sibling of `TestConvertFieldMalformedName` /
+    `TestConvertMetricMalformedName`: a model `name` that is present but not
+    a string (an int, a bool) used to raise a bare `TypeError` out of
+    `identifiers.normalise` inside `convert()` itself, rather than degrading
+    the way an unfoldable (but string) name already does via
+    `TS-MODEL-NAME-UNNORMALISABLE`. See https://github.com/apache/ossie/issues/469.
+
+    The type check reads the raw `name` value before the `or ""` fallback
+    coercion, so a falsy-but-present value (`0`, `False`, `None`) is reported
+    the same as a truthy one (`42`, `True`): both are an explicit non-string
+    value, not a missing key.
+    """
+
+    @pytest.mark.parametrize("bad_name", [42, True, 0, False, None])
+    def test_a_non_string_model_name_falls_back_and_is_reported(self, bad_name):
+        orders = _table("ORDERS", columns=[_column("Amount", "AMOUNT", "DOUBLE")])
+        model = _model(
+            name=bad_name,
+            model_tables=[{"name": "ORDERS"}],
+            columns=[_attribute("Amount", "ORDERS::Amount")],
+        )
+        result = convert(_document_set(model, orders))
+        assert result.model["name"] == "model"
+        assert any(i["code"] == "TS-MODEL-NAME-INVALID" for i in result.issues.as_dicts())
+        # The rest of the model still converts: a malformed model name does
+        # not take the whole document down.
+        assert result.model["datasets"][0]["fields"][0]["name"] == "amount"
+
+    def test_an_empty_string_model_name_falls_back_silently(self):
+        # An explicit empty string is not a malformed value: falls back to
+        # "model" with no TS-MODEL-NAME-INVALID report.
+        orders = _table("ORDERS", columns=[_column("Amount", "AMOUNT", "DOUBLE")])
+        model = _model(
+            name="",
+            model_tables=[{"name": "ORDERS"}],
+            columns=[_attribute("Amount", "ORDERS::Amount")],
+        )
+        result = convert(_document_set(model, orders))
+        assert result.model["name"] == "model"
+        assert not any(i["code"] == "TS-MODEL-NAME-INVALID" for i in result.issues.as_dicts())
+
+    def test_a_missing_model_name_key_falls_back_silently(self):
+        # No `name` key at all (as opposed to an explicit falsy value) is
+        # not a malformed value either: falls back to "model" with no
+        # TS-MODEL-NAME-INVALID report.
+        orders = _table("ORDERS", columns=[_column("Amount", "AMOUNT", "DOUBLE")])
+        model = _model(
+            model_tables=[{"name": "ORDERS"}],
+            columns=[_attribute("Amount", "ORDERS::Amount")],
+        )
+        del model.body["name"]
+        result = convert(_document_set(model, orders))
+        assert result.model["name"] == "model"
+        assert not any(i["code"] == "TS-MODEL-NAME-INVALID" for i in result.issues.as_dicts())
+
+
 class TestKeyDerivationEdgeCasesCommitted:
     """Edge cases attacked and confirmed by hand during development, now
     committed so the check runs on every future change instead of living

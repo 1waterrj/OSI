@@ -494,6 +494,41 @@ def _resolve_name_collision(
     return {**built, "name": candidate}
 
 
+def _column_display_name(column: dict, log: IssueLog, *, kind: str) -> str | None:
+    """The `name` a `columns[]` entry must carry to become a field or metric,
+    or `None` if it cannot.
+
+    `column["name"]` used to be read directly in `convert_field`/
+    `convert_metric`, so a `columns[]` entry with no `name` key raised a bare
+    `KeyError`, and one whose `name` was present but not a string (an int,
+    `null`, or a bool) propagated as a bare `TypeError` out of
+    `identifiers.normalise` two calls later, inside
+    `_field_or_metric_identifier`, both breaking stash.py's own
+    "never a bare traceback" contract. Both are now reported and the column
+    skipped, the same graceful degradation every other `TS-{KIND}-*` gap in
+    `convert_field`/`convert_metric` already gets, rather than aborting the
+    whole model over one malformed column.
+    """
+    if "name" not in column:
+        log.add(
+            code=f"TS-{kind.upper()}-NO-NAME",
+            severity=Severity.WARNING,
+            message=f"a column has no 'name'; it cannot become a {kind}",
+            object_ref=f"{kind}:<unnamed>",
+        )
+        return None
+    name = column["name"]
+    if not isinstance(name, str):
+        log.add(
+            code=f"TS-{kind.upper()}-NAME-INVALID",
+            severity=Severity.WARNING,
+            message=f"column name {name!r} is not a string; it cannot become a {kind}",
+            object_ref=f"{kind}:{name!r}",
+        )
+        return None
+    return name
+
+
 def _field_or_metric_identifier(
     display_name: str,
     physical_hint: str | None,
@@ -608,7 +643,9 @@ def convert_field(
     if allocator is None:
         allocator = identifiers.Allocator()
 
-    display_name = column["name"]
+    display_name = _column_display_name(column, log, kind="field")
+    if display_name is None:
+        return None
     object_ref = f"field:{display_name}"
 
     if "column_id" in column:
@@ -972,7 +1009,9 @@ def convert_metric(
     if allocator is None:
         allocator = identifiers.Allocator()
 
-    display_name = column["name"]
+    display_name = _column_display_name(column, log, kind="metric")
+    if display_name is None:
+        return None
     object_ref = f"metric:{display_name}"
 
     aggregation_raw = properties.get("aggregation", "NONE")
@@ -2047,7 +2086,27 @@ def convert(document_set: DocumentSet) -> OssieConversion:
     log = IssueLog()
     model_body = document_set.model.body
 
-    model_display_name = model_body.get("name") or ""
+    model_name_raw = model_body.get("name")
+    if "name" in model_body and not isinstance(model_name_raw, str):
+        # Same malformed-type hazard as a column `name` (see
+        # `_column_display_name`): the model has no field to skip, so it
+        # falls back the same way an empty name already does, just with a
+        # WARNING naming what was dropped. Checked before the `or ""`
+        # coercion below so a falsy-but-present value (`0`, `False`, `None`)
+        # is reported the same as a truthy one (`42`, `True`): both are an
+        # explicit non-string value, not a missing key.
+        log.add(
+            code="TS-MODEL-NAME-INVALID",
+            severity=Severity.WARNING,
+            message=(
+                f"model name {model_name_raw!r} is not a string; the "
+                f"semantic model is named 'model' instead"
+            ),
+            object_ref=f"model:{model_name_raw!r}",
+        )
+        model_display_name = ""
+    else:
+        model_display_name = model_name_raw or ""
     if not model_display_name:
         semantic_model_name = "model"
     else:
