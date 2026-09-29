@@ -18,6 +18,7 @@
 """Tests for OssieToMSIConverter."""
 
 import pytest
+from pydantic import ValidationError
 from syrupy.assertion import SnapshotAssertion
 
 from ossie import (
@@ -58,11 +59,9 @@ from tests.helpers import (
 
 
 class TestOssieToMSIBasicConversion:
-    def test_empty_document_produces_empty_manifest(self) -> None:
-        result = OssieToMSIConverter().convert(_ossie_doc()).output
-
-        assert result.semantic_models == []
-        assert result.metrics == []
+    def test_empty_document_is_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            _ossie_doc(datasets=[])
 
     def test_single_dataset_becomes_semantic_model(self) -> None:
         doc = _ossie_doc(datasets=[_ossie_dataset("orders", source="analytics.orders_table")])

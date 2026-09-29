@@ -317,3 +317,20 @@ def test_relationship_with_python_name() -> None:
         to_columns=["id"],
     )
     assert relationship.from_dataset == "orders"
+
+
+def test_expression_dialects_min_length() -> None:
+    with pytest.raises(ValidationError):
+        OssieExpression(dialects=[])
+
+
+def test_relationship_columns_min_length() -> None:
+    with pytest.raises(ValidationError):
+        OssieRelationship(name="rel", from_dataset="a", to="b", from_columns=[], to_columns=["id"])
+    with pytest.raises(ValidationError):
+        OssieRelationship(name="rel", from_dataset="a", to="b", from_columns=["id"], to_columns=[])
+
+
+def test_semantic_model_datasets_min_length() -> None:
+    with pytest.raises(ValidationError):
+        OssieSemanticModel(name="model", datasets=[])

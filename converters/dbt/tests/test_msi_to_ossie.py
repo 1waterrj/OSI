@@ -87,14 +87,9 @@ def _ossie_metrics(result: OssieDocument) -> list:
 
 
 class TestBasicConversion:
-    def test_empty_manifest_produces_empty_datasets(self) -> None:
-        result = MSIToOssieConverter().convert(_manifest(), ossie_model_name="test").output
-
-        assert result.version == "0.2.0.dev0"
-        assert result.name == "test"
-        assert result.datasets == []
-        assert result.metrics is None
-        assert result.relationships is None
+    def test_empty_manifest_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="no semantic models"):
+            MSIToOssieConverter().convert(_manifest(), ossie_model_name="test")
 
     def test_semantic_model_becomes_dataset(self) -> None:
         sm = semantic_model_with_guaranteed_meta(

@@ -93,6 +93,10 @@ class MSIToOssieConverter:
         issues: List[ConverterIssue] = []
 
         datasets = [self._convert_semantic_model(sm) for sm in manifest.semantic_models]
+        if not datasets:
+            raise ValueError(
+                "Manifest contains no semantic models; an Ossie semantic model requires at least one dataset."
+            )
 
         entity_index, entity_issues = self._build_entity_index(manifest.semantic_models)
         issues.extend(entity_issues)

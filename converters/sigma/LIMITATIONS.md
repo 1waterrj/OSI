@@ -45,6 +45,10 @@ element with another `kind` is preserved verbatim at the model level under
 `non_table_elements` with an `UNSUPPORTED_ELEMENT_KIND` issue. This is a defensive
 path, not an expected one.
 
+An Ossie semantic model requires at least one dataset. A Sigma spec with no `table`
+elements (or where every table element lacks an id) cannot produce a valid Ossie
+document and is rejected with a `ValueError`.
+
 ## Non-warehouse-table sources have no `OssieDataset.source`
 
 `source.kind` may be `warehouse-table`, `sql`, `table`, `data-model`, `join`, or
@@ -62,6 +66,9 @@ Sigma addresses a relationship key either by the element's own column id or by a
 the modeled column list. The converter resolves both to a modeled field name where it
 can, records `RELATIONSHIP_COLUMN_UNRESOLVED` where it cannot, and **always** keeps the
 raw `keys` in `custom_extensions`, so Sigma → Ossie → Sigma is exact either way.
+A relationship with no join keys (`keys: []` or missing keys) cannot be represented as
+an Ossie relationship (which requires at least one join column on each side) and is
+dropped with a `RELATIONSHIP_DROPPED` issue.
 
 Unsolved: a document authored by another tool has no raw keys to fall back on, so
 export must synthesize key ids from field names. That works when every joined field is
