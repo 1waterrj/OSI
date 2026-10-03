@@ -30,7 +30,9 @@ from ossie_dbt.converter_issues import ConverterIssue, ConverterIssueType, Conve
 from ossie_dbt.expression_utils import (
     ROW_COUNT_EXPR,
     _extract_agg_info,
+    _contains_distinct_row_count,
     _get_dataset_qualifier,
+    _is_constant_expr,
     _strip_qualifier,
     _try_parse_ratio,
 )
@@ -76,7 +78,12 @@ class _KeySets:
 
 
 class _UnresolvedRowCountDataset(Exception):
-    """A ``COUNT(*)`` that does not identify exactly one dataset to count the rows of."""
+    """A row-count expression that cannot be safely converted into a metric.
+
+    Either it does not identify exactly one dataset to count the rows of (a bare ``COUNT(*)`` with
+    more than one dataset, or a qualifier matching none or several), or it is a form with no sensible
+    translation at all, such as ``COUNT(DISTINCT *)``.
+    """
 
 
 class OssieToMSIConverter:
@@ -304,7 +311,8 @@ class OssieToMSIConverter:
         agg_result = _extract_agg_info(expr_str)
         if agg_result is not None:
             agg, col, percentile, use_discrete = agg_result
-            if agg is AggregationType.COUNT and col == ROW_COUNT_EXPR:
+            is_row_count = agg is AggregationType.COUNT and col == ROW_COUNT_EXPR
+            if is_row_count or (agg is AggregationType.SUM and _is_constant_expr(col)):
                 # A constant, not a column: it must not go through the column → dataset lookup.
                 semantic_model_name = self._find_dataset_for_row_count(expr_str, datasets)
             else:
@@ -359,6 +367,13 @@ class OssieToMSIConverter:
                 config=None,
             )
             return [*num_metrics, *den_metrics, ratio_metric]
+
+        # COUNT(DISTINCT *) / COUNT(DISTINCT 1) / ..., anywhere in the expression (bare, wrapped in
+        # parens, or combined with other operations): not a column count and not a row count either
+        # (it answers whether any row exists, 0 or 1). Drop rather than fall back to a raw SUM of it,
+        # which MetricFlow cannot run and which would guess a dataset the way a row count must not.
+        if _contains_distinct_row_count(expr_str):
+            raise _UnresolvedRowCountDataset(f"{expr_str!r} has no sensible SIMPLE or RATIO translation")
 
         # --- Fallback: complex expression that can't be decomposed ---
         # Store the raw expression in `expr` with a best-guess aggregation type.
