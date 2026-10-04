@@ -25,68 +25,107 @@ Usage:
 """
 
 import argparse
+import re
 import sys
 import warnings
 
 import yaml
+from sqlglot import tokenize
+from sqlglot.errors import TokenError
+from sqlglot.tokens import TokenType
 
 
 SUPPORTED_VERSION = "0.2.0.dev0"
 
+_TIME_DATATYPES = frozenset({"Date", "Time", "DateTime", "DateTimeTz"})
 
-class OsiConversionError(Exception):
+_SNOWFLAKE_DATATYPES = {
+    "String": "VARCHAR",
+    "Integer": "NUMBER(38,0)",
+    "Decimal": "NUMBER",
+    "Float": "FLOAT",
+    "Boolean": "BOOLEAN",
+    "Date": "DATE",
+    "Time": "TIME",
+    "DateTime": "TIMESTAMP_NTZ",
+    "DateTimeTz": "TIMESTAMP_TZ",
+}
+
+
+class OssieConversionError(Exception):
     """Raised when an Ossie YAML cannot be converted to Snowflake format."""
 
 
-def convert_osi_to_snowflake(osi_yaml_str):
+def _convert_datatype(datatype, field_name):
+    """Map an Ossie logical datatype to a Snowflake field data type.
+
+    Missing datatypes remain unspecified. ``Opaque`` and unrecognized values
+    cannot be mapped safely, so they are omitted with a warning.
+    """
+    if datatype is None:
+        return None
+
+    if datatype == "Opaque":
+        warnings.warn(
+            f"Omitting data_type from field '{field_name}': "
+            "Ossie datatype 'Opaque' has no portable Snowflake mapping"
+        )
+        return None
+
+    snowflake_datatype = _SNOWFLAKE_DATATYPES.get(datatype)
+    if snowflake_datatype is None:
+        warnings.warn(
+            f"Omitting data_type from field '{field_name}': "
+            f"unrecognized Ossie datatype '{datatype}'"
+        )
+    return snowflake_datatype
+
+
+def convert_ossie_to_snowflake(ossie_yaml_str):
     """Top-level entry point. Parses Ossie YAML, validates, converts, returns
     Snowflake YAML string.
 
-    Expects the standard Ossie wrapped format::
+    Expects the standard Ossie document format::
 
         version: "0.2.0.dev0"
-        semantic_model:
-          - name: ...
+        name: ...
+        datasets: [...]
 
     Args:
-        osi_yaml_str: Ossie YAML as a string.
+        ossie_yaml_str: Ossie YAML as a string.
 
     Returns:
         Snowflake Cortex Analyst semantic model YAML string.
 
     Raises:
-        OsiConversionError: If the input cannot be converted.
+        OssieConversionError: If the input cannot be converted.
     """
-    root = yaml.safe_load(osi_yaml_str)
+    root = yaml.safe_load(ossie_yaml_str)
     if not isinstance(root, dict):
-        raise OsiConversionError("Invalid Ossie YAML: expected a mapping at the root")
+        raise OssieConversionError("Invalid Ossie YAML: expected a mapping at the root")
 
     version_str = str(root.get("version", ""))
     if version_str != SUPPORTED_VERSION:
-        raise OsiConversionError(
+        raise OssieConversionError(
             f"Unsupported Ossie specification version '{version_str}'. "
             f"Supported: {SUPPORTED_VERSION}"
         )
 
-    semantic_model = root.get("semantic_model")
-    if not isinstance(semantic_model, list) or len(semantic_model) == 0:
-        raise OsiConversionError(
-            "Invalid Ossie YAML: 'semantic_model' must be a non-empty list"
+    if "semantic_model" in root:
+        raise OssieConversionError(
+            "Legacy 'semantic_model' wrappers are not supported; "
+            "place the model properties directly at the document root"
         )
 
-    if len(semantic_model) > 1:
-        warnings.warn(
-            f"Ossie YAML contains {len(semantic_model)} semantic models; "
-            f"only the first will be converted"
-        )
+    if "dialects" in root or "vendors" in root:
+        raise OssieConversionError("Root dialects and vendors are not supported by the Ossie spec")
 
-    ossie = semantic_model[0]
-    if not isinstance(ossie, dict):
-        raise OsiConversionError(
-            "Invalid Ossie YAML: 'semantic_model' entries must be mappings"
-        )
-
-    snowflake_model = _convert_model(ossie)
+    # Document metadata is consumed here; it is not a dropped model property.
+    model = {
+        key: value for key, value in root.items()
+        if key != "version"
+    }
+    snowflake_model = _convert_model(model)
 
     return yaml.dump(
         snowflake_model,
@@ -100,7 +139,7 @@ def _convert_model(ossie):
     """Converts the root Ossie model dict to a Snowflake semantic model dict."""
     name = ossie.get("name")
     if not name:
-        raise OsiConversionError("Missing required 'name' field in semantic model")
+        raise OssieConversionError("Missing required 'name' field in semantic model")
 
     result = {}
     result["name"] = name
@@ -148,7 +187,7 @@ def _convert_dataset(dataset):
     result = {}
     name = dataset.get("name")
     if not name:
-        raise OsiConversionError("Missing required 'name' field in dataset")
+        raise OssieConversionError("Missing required 'name' field in dataset")
     result["name"] = name
 
     # source -> base_table
@@ -191,6 +230,11 @@ def _convert_dataset(dataset):
             converted = _convert_named_expr(field, "field")
             if converted is None:
                 continue
+            snowflake_datatype = _convert_datatype(
+                field.get("datatype"), field.get("name", "<unnamed>")
+            )
+            if snowflake_datatype is not None:
+                converted["data_type"] = snowflake_datatype
             if classification == "time_dimension":
                 time_dimensions.append(converted)
             elif classification == "dimension":
@@ -216,11 +260,31 @@ def _convert_dataset(dataset):
 
 
 def _classify_field(field):
-    """Returns 'dimension', 'time_dimension', or 'fact' based on field structure."""
+    """Classify a field as 'fact', 'dimension', or 'time_dimension'.
+
+    ``datatype`` declares the field's data type; ``dimension.is_time`` is
+    an independent temporal-role marker. Classification rules:
+
+    - A field with no ``dimension`` block is a ``fact`` regardless of
+      ``datatype`` (data type does not imply role).
+    - Explicit ``dimension.is_time`` always wins: ``True`` classifies as
+      ``time_dimension``; ``False`` classifies as ``dimension`` even when
+      ``datatype`` is temporal (author opt-out for e.g. audit timestamps).
+    - When ``dimension.is_time`` is unset, it defaults to ``True`` for
+      temporal ``datatype`` values (``Date``, ``Time``, ``DateTime``,
+      ``DateTimeTz``) and ``False`` otherwise.
+    """
     dimension = field.get("dimension")
     if dimension is None:
         return "fact"
-    if isinstance(dimension, dict) and dimension.get("is_time") is True:
+    is_time = dimension.get("is_time") if isinstance(dimension, dict) else None
+    if is_time is True:
+        return "time_dimension"
+    if is_time is False:
+        return "dimension"
+    # is_time is unset; default from datatype
+    datatype = field.get("datatype")
+    if datatype in _TIME_DATATYPES:
         return "time_dimension"
     return "dimension"
 
@@ -235,7 +299,7 @@ def _convert_named_expr(entry, kind):
     """
     name = entry.get("name")
     if not name:
-        raise OsiConversionError(f"Missing required 'name' in {kind}")
+        raise OssieConversionError(f"Missing required 'name' in {kind}")
 
     expr_str = _extract_expression(entry.get("expression"), name)
     if expr_str is None:
@@ -271,17 +335,17 @@ def _convert_relationship(rel):
     result = {}
     rel_name = rel.get("name")
     if not rel_name:
-        raise OsiConversionError("Missing required 'name' field in relationship")
+        raise OssieConversionError("Missing required 'name' field in relationship")
     result["name"] = rel_name
 
     left_table = rel.get("from")
     if not left_table:
-        raise OsiConversionError(
+        raise OssieConversionError(
             f"Relationship '{rel_name}': missing required 'from' field"
         )
     right_table = rel.get("to")
     if not right_table:
-        raise OsiConversionError(
+        raise OssieConversionError(
             f"Relationship '{rel_name}': missing required 'to' field"
         )
     result["left_table"] = left_table
@@ -291,7 +355,7 @@ def _convert_relationship(rel):
     to_cols = rel.get("to_columns", [])
 
     if len(from_cols) != len(to_cols):
-        raise OsiConversionError(
+        raise OssieConversionError(
             f"Relationship '{rel_name}': from_columns and to_columns must have the "
             f"same length (got {len(from_cols)} and {len(to_cols)})"
         )
@@ -312,23 +376,26 @@ def _convert_relationship(rel):
 def _extract_expression(expression, field_name):
     """Selects the best dialect expression for Snowflake.
 
-    Returns the expression string, or None if only unsupported dialects are
-    present (the field should be skipped). Raises OsiConversionError if the
-    expression or dialects list is missing entirely.
+    Preference order: SNOWFLAKE, then ANSI_SQL, then OSSIE_SQL_2026 (the last two
+    are ANSI-SQL-compatible fallbacks). Returns the expression string, or None if
+    only unsupported dialects are present (the field should be skipped). Raises
+    OssieConversionError if the expression or dialects list is missing entirely.
     """
     if expression is None or not isinstance(expression, dict):
-        raise OsiConversionError(
+        raise OssieConversionError(
             f"Missing or malformed expression for field/metric '{field_name}'"
         )
 
     dialects = expression.get("dialects")
     if not dialects:
-        raise OsiConversionError(
+        raise OssieConversionError(
             f"Missing expression for field/metric '{field_name}'"
         )
 
     snowflake_expr = None
     ansi_expr = None
+    # OSSIE_SQL_2026 is ANSI-SQL-compatible; treated as an ANSI_SQL-equivalent fallback.
+    ossie_sql_expr = None
 
     for d in dialects:
         dialect_name = (d.get("dialect") or "").upper()
@@ -336,16 +403,21 @@ def _extract_expression(expression, field_name):
             snowflake_expr = d.get("expression")
         elif dialect_name == "ANSI_SQL":
             ansi_expr = d.get("expression")
+        elif dialect_name == "OSSIE_SQL_2026":
+            ossie_sql_expr = d.get("expression")
 
     if snowflake_expr is not None:
         return snowflake_expr
     if ansi_expr is not None:
         return ansi_expr
+    if ossie_sql_expr is not None:
+        return ossie_sql_expr
 
     dialect_names = [d.get("dialect", "") for d in dialects]
     warnings.warn(
         f"Skipping field/metric '{field_name}': no Snowflake-compatible expression "
-        f"(has dialects: {', '.join(dialect_names)}; requires SNOWFLAKE or ANSI_SQL)"
+        f"(has dialects: {', '.join(dialect_names)}; requires SNOWFLAKE, ANSI_SQL, "
+        f"or OSSIE_SQL_2026)"
     )
     return None
 
@@ -356,6 +428,30 @@ def _normalize_identifier(identifier):
     if stripped.startswith('"') and stripped.endswith('"'):
         return stripped
     return stripped.upper()
+
+_UNQUOTED_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+_QUOTED_IDENTIFIER = re.compile(r'^"(?:[^"]|"")+"$')
+
+
+def _is_query_source(source_stripped):
+    """Recognize SELECT/WITH sources without requiring a full SQL parse."""
+    # Use Snowflake's comment and identifier rules, including `$` in names.
+    # Full parsing could reject newer Snowflake syntax that should pass through.
+    try:
+        tokens = tokenize(source_stripped, read="snowflake")
+    except TokenError:
+        return False
+
+    for token in tokens:
+        if token.token_type != TokenType.L_PAREN:
+            return token.token_type in (TokenType.SELECT, TokenType.WITH)
+    return False
+
+
+def _is_identifier(part):
+    """True if `part` is a valid quoted or unquoted Snowflake identifier."""
+    return bool(_UNQUOTED_IDENTIFIER.match(part) or _QUOTED_IDENTIFIER.match(part))
+
 
 def _split_identifiers(source_str):
     """Split a dot-separated identifier string while respecting double quotes."""
@@ -374,6 +470,20 @@ def _split_identifiers(source_str):
     parts.append("".join(current).strip())
     return parts
 
+
+def _try_parse_source_relation(source_stripped):
+    """Return a three-part relation, or None if its identifiers are invalid."""
+    parts = _split_identifiers(source_stripped)
+    if len(parts) == 3 and all(_is_identifier(part) for part in parts):
+        # Only uppercase unquoted identifiers; preserve quoted ones as-is.
+        return {
+            "database": _normalize_identifier(parts[0]),
+            "schema": _normalize_identifier(parts[1]),
+            "table": _normalize_identifier(parts[2]),
+        }
+    return None
+
+
 def _parse_source(source):
     """Parses an Ossie dataset source string into a Snowflake base_table dict.
 
@@ -387,24 +497,17 @@ def _parse_source(source):
     if not source_stripped:
         return None
 
-    # Detect subqueries — require whitespace after the keyword to avoid false
-    # positives on table names like WITH_TABLE or SELECT_RESULTS.
-    upper = source_stripped.upper()
-    if upper.startswith(("SELECT ", "SELECT\n", "SELECT\t",
-                          "WITH ", "WITH\n", "WITH\t")):
+    # Preserve query text, including comments, after trimming outer whitespace.
+    if _is_query_source(source_stripped):
         return {"definition": source_stripped}
 
-    parts = _split_identifiers(source_stripped)
-    if len(parts) == 3:
-        # Only uppercase unquoted identifiers; preserve quoted ones as-is.
-        return {
-            "database": _normalize_identifier(parts[0]),
-            "schema": _normalize_identifier(parts[1]),
-            "table": _normalize_identifier(parts[2]),
-        }
+    relation = _try_parse_source_relation(source_stripped)
+    if relation is not None:
+        return relation
 
-    raise OsiConversionError(
-        f"Source '{source}' must be a fully qualified db.schema.table or a subquery"
+    raise OssieConversionError(
+        f"Source '{source}' must be a fully qualified db.schema.table "
+        "(quoted or unquoted identifiers) or a SELECT/WITH query"
     )
 
 
@@ -464,11 +567,11 @@ def main():
     args = parser.parse_args()
 
     with open(args.input, "r") as f:
-        osi_yaml_str = f.read()
+        ossie_yaml_str = f.read()
 
     try:
-        snowflake_yaml_str = convert_osi_to_snowflake(osi_yaml_str)
-    except OsiConversionError as e:
+        snowflake_yaml_str = convert_ossie_to_snowflake(ossie_yaml_str)
+    except OssieConversionError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 

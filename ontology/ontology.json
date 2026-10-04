@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/apache/ossie/core-spec/osi-schema.json",
+  "$id": "https://github.com/apache/ossie/ontology/ontology.json",
   "title": "Apache Ossie Ontology Metadata Specification",
   "description": "JSON Schema for validating Apache Ossie ontology definitions",
   "type": "object",
@@ -19,7 +19,7 @@
       "description": "Human-readable description"
     },
     "ai_context": {
-      "$ref": "https://raw.githubusercontent.com/apache/ossie/main/core-spec/osi-schema.json#/$defs/AIContext"
+      "$ref": "https://raw.githubusercontent.com/apache/ossie/main/core-spec/ossie-schema.json#/$defs/AIContext"
     },
     "requires": {
       "type": "array",
@@ -38,9 +38,18 @@
     },
     "ontology_mappings": {
       "type": "array",
-      "description": "Collection of ontology maps from logical models",
+      "description": "Deprecated. Embedded ontology maps, accepted only so existing documents continue to validate; write mappings as standalone documents validated against ontology/mapping.json instead.",
+      "deprecated": true,
       "items": {
         "$ref": "#/$defs/OntologyMap"
+      }
+    },
+    "prefixes": {
+      "type": "object",
+      "description": "Maps namespace prefixes to the IRIs they abbreviate, enabling QName expansion (e.g., 'foaf' -> 'http://xmlns.com/foaf/0.1/').",
+      "additionalProperties": {
+        "type": "string",
+        "format": "iri"
       }
     }
   },
@@ -51,12 +60,44 @@
       "type": "object",
       "description": "Ontology component that defines a single concept and any relationships that are keyed primarily by that concept",
       "properties": {
+        "concept": {
+          "type": "string",
+          "description": "Unique name of the concept defined by this component"
+        },
+        "type": {
+          "$ref": "#/$defs/ConceptType"
+        },
         "description": {
           "type": "string",
-          "description": "Human-readable description of the component"
+          "description": "Human-readable description of the concept"
         },
-        "concept": {
-          "$ref": "#/$defs/Concept"
+        "extends": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Indicates that this concept extends one or more other concepts"
+        },
+        "derived_by": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Expression"
+          },
+          "description": "Expressions that define how this concept is derived"
+        },
+        "identify_by": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Names of relationships to use as the preferred identifier of this concept"
+        },
+        "requires": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Expression"
+          },
+          "description": "Expressions that constrain the population of this concept"
         },
         "relationships": {
           "type": "array",
@@ -64,9 +105,13 @@
             "$ref": "#/$defs/Relationship"
           },
           "description": "Defines relationships that pertain primarily to the concept defined in this component"
+        },
+        "iri": {
+          "type": "string",
+          "description": "Optional global identifier for this concept, expressed as a full IRI or as a QName (prefix:local) resolved against the ontology-level 'prefixes' map."
         }
       },
-      "required": ["concept"],
+      "required": ["concept", "type"],
       "additionalProperties": false
     },
     "Expression": {
@@ -115,56 +160,13 @@
             "type": "string"
           },
           "description": "Natural language expressions that verbalize this relationship"
+        },
+        "iri": {
+          "type": "string",
+          "description": "Optional global identifier for this relationship, expressed as a full IRI or as a QName (prefix:local) resolved against the ontology-level 'prefixes' map."
         }
       },
       "required": ["name", "verbalizes"],
-      "additionalProperties": false
-    },
-    "Concept": {
-      "type": "object",
-      "description": "Defines a concept in the ontology",
-      "properties": {
-        "name": {
-          "type": "string",
-          "description": "Unique identifier for the concept"
-        },
-        "type": {
-          "$ref": "#/$defs/ConceptType"
-        },
-        "description": {
-          "type": "string",
-          "description": "Human-readable description of the concept"
-        },
-        "extends": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Indicates that this concept extends one or more other concepts"
-        },
-        "derived_by": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Expression"
-          },
-          "description": "Expressions that define how this concept is derived"
-        },
-        "identify_by": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Names of relationships to use as the preferred identifier of this concept"
-        },
-        "requires": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Expression"
-          },
-          "description": "Expressions that constrain the population of this concept"
-        }
-      },
-      "required": ["name", "type"],
       "additionalProperties": false
     },
     "ConceptMapping": {
@@ -296,7 +298,7 @@
           "description": "Human-readable description of this ontology map"
         },
         "semantic_model": {
-          "$ref": "https://raw.githubusercontent.com/apache/ossie/main/core-spec/osi-schema.json#/$defs/SemanticModel"
+          "$ref": "https://raw.githubusercontent.com/apache/ossie/main/core-spec/ossie-schema.json"
         },
         "concept_mappings": {
           "type": "array",

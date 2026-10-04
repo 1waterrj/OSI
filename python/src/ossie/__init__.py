@@ -15,36 +15,45 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from importlib.metadata import version, PackageNotFoundError
+
+try:
+    __version__ = version("apache-ossie")
+except PackageNotFoundError:
+    __version__ = "unknown"
+
 from ossie.models import (
-    OSIAIContext,
-    OSIAIContextObject,
-    OSICustomExtension,
-    OSIDataset,
-    OSIDialect,
-    OSIDialectExpression,
-    OSIDimension,
-    OSIDocument,
-    OSIExpression,
-    OSIField,
-    OSIMetric,
-    OSIRelationship,
-    OSISemanticModel,
-    OSIVendor,
+    OssieAIContext,
+    OssieAIContextObject,
+    OssieCustomExtension,
+    OssieDataset,
+    OssieDataType,
+    OssieDialect,
+    OssieDialectExpression,
+    OssieDimension,
+    OssieDocument,
+    OssieExpression,
+    OssieField,
+    OssieMetric,
+    OssieRelationship,
+    OssieSemanticModel,
+    OssieVendor,
 )
 
 __all__ = [
-    "OSIAIContext",
-    "OSIAIContextObject",
-    "OSICustomExtension",
-    "OSIDataset",
-    "OSIDialect",
-    "OSIDialectExpression",
-    "OSIDimension",
-    "OSIDocument",
-    "OSIExpression",
-    "OSIField",
-    "OSIMetric",
-    "OSIRelationship",
-    "OSISemanticModel",
-    "OSIVendor",
+    "OssieAIContext",
+    "OssieAIContextObject",
+    "OssieCustomExtension",
+    "OssieDataset",
+    "OssieDataType",
+    "OssieDialect",
+    "OssieDialectExpression",
+    "OssieDimension",
+    "OssieDocument",
+    "OssieExpression",
+    "OssieField",
+    "OssieMetric",
+    "OssieRelationship",
+    "OssieSemanticModel",
+    "OssieVendor",
 ]

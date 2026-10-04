@@ -20,8 +20,9 @@
 package org.apache.ossie.converter.polaris;
 
 import com.fasterxml.jackson.databind.JsonNode;
-import org.apache.ossie.converter.polaris.model.OsiModel;
-import org.apache.ossie.converter.polaris.model.OsiModel.*;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import org.apache.ossie.converter.polaris.model.OssieModel;
+import org.apache.ossie.converter.polaris.model.OssieModel.*;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -33,7 +34,7 @@ import java.util.List;
  * <p>
  * Reads namespaces and tables from a Polaris catalog via the Iceberg REST API,
  * maps Iceberg table schemas to Ossie datasets and fields, and produces a complete
- * {@link OsiModel}.
+ * {@link OssieModel}.
  */
 public class PolarisImporter {
 
@@ -44,23 +45,33 @@ public class PolarisImporter {
     }
 
     /**
-     * Import all tables from all namespaces in the catalog into an Ossie model.
-     * Each namespace becomes a separate semantic model.
+     * Import all tables from all namespaces in the catalog.
+     * Each nonempty namespace becomes a separate Ossie document, in namespace order.
      */
-    public OsiModel importCatalog() throws IOException, InterruptedException {
-        OsiModel model = new OsiModel();
-        model.setVersion("0.2.0.dev0");
+    public List<OssieModel> importCatalog() throws IOException, InterruptedException {
+        List<OssieModel> models = new ArrayList<>();
 
-        List<List<String>> namespaces = client.listNamespaces();
+        List<List<String>> namespaces = new ArrayList<>(client.listNamespaces());
+
+        namespaces.sort((left, right) -> {
+            for (int i = 0; i < Math.min(left.size(), right.size()); i++) {
+                int comparison = left.get(i).compareTo(right.get(i));
+                if (comparison != 0) return comparison;
+            }
+            return Integer.compare(left.size(), right.size());
+        });
 
         for (List<String> namespace : namespaces) {
             SemanticModel sm = importNamespace(namespace);
             if (sm != null && !sm.getDatasets().isEmpty()) {
-                model.getSemanticModels().add(sm);
+                OssieModel model = new OssieModel();
+                model.setVersion("0.2.0.dev0");
+                model.setSemanticModel(sm);
+                models.add(model);
             }
         }
 
-        return model;
+        return models;
     }
 
     /**
@@ -177,18 +188,31 @@ public class PolarisImporter {
      */
     private Field mapColumnToField(JsonNode column) {
         String name = column.get("name").asText();
-        String icebergType = resolveType(column.get("type"));
+        JsonNode icebergTypeNode = column.get("type");
+        String icebergType = IcebergTypeMapper.displayIcebergType(icebergTypeNode);
+        String datatype = IcebergTypeMapper.toOssieDatatype(icebergTypeNode);
 
         Field field = new Field();
         field.setName(name);
+        field.setDatatype(datatype);
 
         // The expression is just the column name (direct mapping)
         DialectExpression expr = new DialectExpression("ANSI_SQL", name);
         field.setExpressions(Collections.singletonList(expr));
 
-        // Detect time-based dimensions from Iceberg types
-        if (isTemporalType(icebergType)) {
+        // Preserve the converter's existing temporal-role classification.
+        if (IcebergTypeMapper.isTemporalDatatype(datatype)) {
             field.setTime(true);
+        }
+
+        // DataType is intentionally logical and loses physical details such as
+        // integer width, decimal precision/scale, timestamp precision, and nested
+        // structure. Preserve the complete Iceberg type for exact round trips.
+        if (icebergTypeNode != null) {
+            ObjectNode extensionData = client.getObjectMapper().createObjectNode();
+            extensionData.set(IcebergTypeMapper.ICEBERG_TYPE_KEY, icebergTypeNode.deepCopy());
+            field.setCustomExtensions(Collections.singletonList(
+                    new CustomExtension(IcebergTypeMapper.POLARIS_VENDOR, extensionData.toString())));
         }
 
         // Add type information as description
@@ -196,48 +220,6 @@ public class PolarisImporter {
                 + (isRequired(column) ? " (required)" : " (optional)"));
 
         return field;
-    }
-
-    /**
-     * Resolve an Iceberg type node to a type string.
-     * Handles both primitive types (strings) and complex types (struct, list, map).
-     */
-    private String resolveType(JsonNode typeNode) {
-        if (typeNode == null) {
-            return "unknown";
-        }
-        if (typeNode.isTextual()) {
-            return typeNode.asText();
-        }
-        if (typeNode.isObject()) {
-            String type = typeNode.has("type") ? typeNode.get("type").asText() : "unknown";
-            switch (type) {
-                case "struct":
-                    return "struct";
-                case "list":
-                    String elementType = resolveType(typeNode.path("element"));
-                    return "list<" + elementType + ">";
-                case "map":
-                    String keyType = resolveType(typeNode.path("key"));
-                    String valueType = resolveType(typeNode.path("value"));
-                    return "map<" + keyType + ", " + valueType + ">";
-                case "fixed":
-                    return "fixed[" + typeNode.path("length").asInt() + "]";
-                case "decimal":
-                    return "decimal(" + typeNode.path("precision").asInt()
-                            + ", " + typeNode.path("scale").asInt() + ")";
-                default:
-                    return type;
-            }
-        }
-        return "unknown";
-    }
-
-    private boolean isTemporalType(String icebergType) {
-        return "timestamp".equals(icebergType)
-                || "timestamptz".equals(icebergType)
-                || "date".equals(icebergType)
-                || "time".equals(icebergType);
     }
 
     private boolean isRequired(JsonNode column) {

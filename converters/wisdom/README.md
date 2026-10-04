@@ -27,24 +27,24 @@ YAML document.
 
 ```bash
 pip install -e ../../python -e .
-ossie-wisdom wisdom-to-osi -i domain-export.json -o semantic_model.yaml
-ossie-wisdom osi-to-wisdom -i semantic_model.yaml -o domain-export.json
+ossie-wisdom wisdom-to-ossie -i domain-export.json -o semantic_model.yaml
+ossie-wisdom ossie-to-wisdom -i semantic_model.yaml -o domain-export.json
 ```
 
 Conversion warnings (information loss) are printed to stderr; the output YAML validates
-against the [Ossie JSON Schema](../../core-spec/osi-schema.json):
+against the [Ossie JSON Schema](../../core-spec/ossie-schema.json):
 
 ```bash
-python ../../validation/validate.py semantic_model.yaml --schema ../../core-spec/osi-schema.json
+python ../../validation/validate.py semantic_model.yaml --schema ../../core-spec/ossie-schema.json
 ```
 
 ## Field mapping
 
 | Ossie | Wisdom |
 |-------|--------|
-| `semantic_model[].name` | domain `ref.name` |
-| `semantic_model[].description` | domain `description` |
-| `semantic_model[].ai_context` | `domainSystemInstructions` + each domain `knowledge[].content` as a bulleted list |
+| `name` | domain `ref.name` |
+| `description` | domain `description` |
+| `ai_context` | `domainSystemInstructions` + each domain `knowledge[].content` as a bulleted list |
 | `datasets[].name` | table `ref.name` |
 | `datasets[].source` | table `location.database.schema.dbTable` |
 | `datasets[].description` | table `description` |
@@ -67,9 +67,14 @@ Ossie encodes cardinality by direction (`from` = many side, `to` = one side), so
 | Wisdom `relationshipType` | Ossie |
 |---------------------------|-------|
 | `MANY_TO_ONE` | `from` = left, `to` = right |
-| `ONE_TO_MANY` | `from` = right, `to` = left |
-| `ONE_TO_ONE` | `from` = left, plus an `ai_context` note (direction is arbitrary) |
-| `MANY_TO_MANY` | `from` = left, plus an `ai_context` note and a `CARDINALITY_LOSS` warning |
+| `ONE_TO_MANY` | `from` = right, `to` = left, plus the note `one-to-many relationship` |
+| `ONE_TO_ONE` | `from` = left, plus the note `one-to-one relationship` (direction is arbitrary) |
+| `MANY_TO_MANY` | `from` = left, plus the note `many-to-many relationship; cardinality is not representable in Ossie` and a `CARDINALITY_LOSS` warning |
+
+The notes are written to the relationship's `ai_context` so the export direction can
+restore the original type. They are matched exactly (ignoring leading and trailing
+whitespace), so editing a note changes the
+exported cardinality (see below).
 
 Compound join conditions that are an `AND` of equality conditions are flattened into
 positional `from_columns`/`to_columns` arrays; any other compound condition (e.g. `OR`)
@@ -77,7 +82,7 @@ drops the relationship with a `RELATIONSHIP_DROPPED` warning.
 
 ## Ossie → wisdom (export direction)
 
-`osi-to-wisdom` emits a domain export mirroring wisdom's `exportDomain` JSON, inverting
+`ossie-to-wisdom` emits a domain export mirroring wisdom's `exportDomain` JSON, inverting
 the mapping above so that wisdom → Ossie → wisdom and Ossie → wisdom → Ossie round-trips
 are stable:
 
@@ -86,9 +91,12 @@ are stable:
 - A field whose expression is just its own (possibly quoted) name becomes a column;
   anything else becomes a formula. `dimension.is_time` becomes a `TIMESTAMP` data type
   (wisdom re-derives exact types from the warehouse).
-- Relationships become `MANY_TO_ONE` edges (Ossie's `from` is the many side); the
-  `ai_context` notes written by `wisdom-to-osi` restore `ONE_TO_ONE`/`MANY_TO_MANY`, and
-  composite keys become compound `AND` join conditions.
+- Relationships become `MANY_TO_ONE` edges (Ossie's `from` is the many side). A relationship
+  whose `ai_context` is exactly one of the notes written by `wisdom-to-ossie` gets its type
+  back: `ONE_TO_ONE`, `MANY_TO_MANY`, or `ONE_TO_MANY` with the two sides swapped back. Any
+  other `ai_context` on a relationship, including a hand-edited note, is dropped with an
+  `AI_CONTEXT_DROPPED` warning and the edge stays `MANY_TO_ONE`. Composite keys become
+  compound `AND` join conditions.
 - Metrics attach to the first dataset their expression references (a
   `METRIC_TABLE_UNRESOLVED` warning falls back to the first dataset).
 - Connections are per-dialect placeholders (`et-connection-snowflake`, ...) expected to be

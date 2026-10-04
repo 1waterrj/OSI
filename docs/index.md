@@ -47,7 +47,7 @@ Ossie addresses semantic fragmentation by providing:
 
 ### Specification at a Glance
 
-The Ossie core specification (current version: **0.2.0.dev0**, latest released: **0.1.1**) defines a YAML-based format for describing semantic models. The key constructs are:
+The Ossie core specification (current version: **0.2.0.dev0**, latest released: **0.1.1**) defines a JSON/YAML format with one semantic model per document. Model properties such as `name` and `datasets` sit directly at the root alongside `version`, without a `semantic_model` wrapper. See the [migration guidance](../core-spec/spec.md#migrating-earlier-document-shapes). The key constructs are:
 
 | Construct | Description |
 |-----------|-------------|
@@ -188,7 +188,7 @@ A typical Ossie-based workflow looks like this:
 
 1. **Author**: A semantic model is authored in one tool (e.g., dbt) or directly in the Ossie YAML format.
 2. **Import**: If authored in a vendor tool, the vendor's import converter translates it into an Ossie model, preserving vendor-specific metadata in `custom_extensions`.
-3. **Validate**: The Ossie model is validated against the [JSON Schema](../core-spec/osi-schema.json) and the [validation script](../validation/validate.py) to ensure correctness.
+3. **Validate**: The Ossie model is validated against the [JSON Schema](../core-spec/ossie-schema.json) and the [validation script](../validation/validate.py) to ensure correctness.
 4. **Exchange**: The Ossie model is shared — via Git, a data catalog, or a sync API — with other teams and tools.
 5. **Export**: Each consuming tool's export converter translates the Ossie model into its native format, selecting the appropriate SQL dialect and applying vendor-specific extensions.
 6. **Round-Trip**: When changes are made in a downstream tool, they can be imported back into the Ossie model, preserving all metadata for lossless round-tripping.
@@ -237,7 +237,7 @@ You can contribute a converter. The [Converters Guide](../converters/README.md) 
 No. Import converters translate existing vendor-specific models into the Ossie format automatically. Your existing models remain intact — Ossie provides an additional interchange layer on top of them.
 
 **How do I validate an Ossie model?**
-Use the [validation script](../validation/validate.py) included in the repository. It checks your model against the [JSON Schema](../core-spec/osi-schema.json), validates SQL expressions across dialects, and ensures referential integrity between datasets and relationships.
+Use the [validation script](../validation/validate.py) included in the repository. It checks your model against the [JSON Schema](../core-spec/ossie-schema.json), validates SQL expressions across dialects, and ensures referential integrity between datasets and relationships.
 
 ### Technical
 
@@ -316,7 +316,7 @@ A practical guide for organizations looking to adopt Ossie.
 |------|------------|
 | **Semantic Model** | A structured description of business data that defines datasets, fields, relationships, and metrics. It provides a shared vocabulary for interpreting data across tools and teams. |
 | **Dataset** | A logical representation of a business entity, typically corresponding to a fact table or dimension table in a data warehouse. |
-| **Field** | A row-level attribute within a dataset, used for grouping, filtering, or as part of metric expressions. Fields can be simple column references or computed expressions. |
+| **Field** | A row-level attribute within a dataset, used for grouping, filtering, or as part of metric expressions. Fields can be simple column references or computed expressions. A field's logical data type is declared by the optional top-level `datatype` field (one of `String`, `Integer`, `Decimal`, `Float`, `Boolean`, `Date`, `Time`, `DateTime`, `DateTimeTz`, or `Opaque`). |
 | **Dimension** | A categorical attribute used to slice and filter data (e.g., region, product category, date). In Ossie, dimensions are represented as fields with optional metadata such as `is_time`. |
 | **Metric** | A quantitative measure computed by aggregating data across one or more datasets (e.g., total revenue, average order value). Metrics are defined at the semantic model level. |
 | **Relationship** | A foreign key connection between two datasets, defining how they can be joined. Relationships are always many-to-one (from the referencing dataset to the referenced dataset). |
@@ -338,7 +338,7 @@ A practical guide for organizations looking to adopt Ossie.
 - **GitHub**: [github.com/apache/ossie](https://github.com/apache/ossie)
 - **Slack**: [join slack](https://join.slack.com/t/opensemanticx/shared_invite/zt-3yuad6c0h-MaoPgVSD1g9MEOf1_QeaiQ)
 - **Core Specification**: [core-spec/spec.md](../core-spec/spec.md)
-- **JSON Schema**: [core-spec/osi-schema.json](../core-spec/osi-schema.json)
+- **JSON Schema**: [core-spec/ossie-schema.json](../core-spec/ossie-schema.json)
 - **YAML Schema**: [core-spec/spec.yaml](../core-spec/spec.yaml)
 - **TPC-DS Example Model**: [examples/tpcds_semantic_model.yaml](../examples/tpcds_semantic_model.yaml)
 - **Validation Script**: [validation/validate.py](../validation/validate.py)

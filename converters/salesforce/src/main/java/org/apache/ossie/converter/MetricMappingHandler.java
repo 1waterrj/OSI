@@ -24,6 +24,7 @@ import static org.apache.ossie.util.DataStructureUtils.*;
 
 import org.apache.ossie.converter.ConverterConstants.Level;
 import org.apache.ossie.converter.pipeline.PipelineStep;
+import org.apache.ossie.exception.ConversionException;
 import java.util.*;
 
 import org.apache.ossie.util.MappingUtils;
@@ -58,35 +59,70 @@ public class MetricMappingHandler implements PipelineStep {
     @Override
     public void execute(Map<String, Object> sourceData, Map<String, Object> outputData, Map<String, String> mappings) {
         logger.debug("Mapping metrics in {} direction", direction);
-        if (direction == ConversionDirection.OSI_TO_SALESFORCE) {
-            mapOsiToSalesforce(sourceData, outputData, mappings);
+        if (direction == ConversionDirection.OSSIE_TO_SALESFORCE) {
+            mapOssieToSalesforce(sourceData, outputData, mappings);
         } else {
-            mapSalesforceToOsi(sourceData, outputData, mappings);
+            mapSalesforceToOssie(sourceData, outputData, mappings);
         }
     }
 
     /**
      * Maps Ossie metrics to Salesforce semanticCalculatedMeasurements.
      */
-    private void mapOsiToSalesforce(
+    private void mapOssieToSalesforce(
             Map<String, Object> sourceData, Map<String, Object> outputData, Map<String, String> mappings) {
 
-        List<Object> osiMetrics = getList(sourceData, METRICS);
-        if (osiMetrics == null) {
+        List<Object> ossieMetrics = getList(sourceData, METRICS);
+        if (ossieMetrics == null) {
             return;
+        }
+
+        Set<String> names = new HashSet<>();
+        for (Object metric : ossieMetrics) {
+            String name = getString(asMap(metric), NAME);
+            if (!names.add(name)) {
+                throw new ConversionException("Metric '" + name + "': duplicate metric name");
+            }
         }
 
         // Filter mappings to get only metric-related entries
         Map<String, String> metricMappings = MappingUtils.filterMappingsByPrefix(mappings, METRICS);
+
+        Map<String, Object> mappedData = GenericMappingEngine.applyMappings(sourceData, metricMappings);
         metricMappings.keySet().forEach(mappings::remove);
 
-        logger.debug("Metrics are not mapped in Ossie to Salesforce direction");
+        outputData.putAll(mappedData);
+
+        customExtensionHandler.restoreCustomExtensionsAtLevel(outputData, sourceData, Level.METRICS);
+
+        List<Object> sfMetrics = getList(outputData, SEMANTIC_CALCULATED_MEASUREMENTS);
+        if (sfMetrics != null) {
+            unwrapExpressions(ossieMetrics, sfMetrics, sourceData, outputData);
+            applyDefaults(sfMetrics);
+        } else if (!ossieMetrics.isEmpty()) {
+            throw new ConversionException("Metric '" + getString(asMap(ossieMetrics.get(0)), NAME)
+                    + "': metric mappings produced no calculated measurements");
+        }
+    }
+
+    /**
+     * Ossie metrics have no label field; Salesforce requires one. Default it to apiName,
+     * matching DatasetMappingHandler/SemanticModelMappingHandler, unless custom_extensions
+     * already restored an exact Salesforce label.
+     */
+    private void applyDefaults(List<Object> sfMetrics) {
+        for (Object sfMetricObj : sfMetrics) {
+            Map<String, Object> sfMetric = asMap(sfMetricObj);
+            if (!sfMetric.containsKey(LABEL) && sfMetric.containsKey(API_NAME)) {
+                sfMetric.put(LABEL, getString(sfMetric, API_NAME));
+            }
+        }
     }
 
     /**
      * Maps Salesforce semanticCalculatedMeasurements to Ossie metrics.
      */
-    private void mapSalesforceToOsi(
+    private void mapSalesforceToOssie(
             Map<String, Object> sourceData, Map<String, Object> outputData, Map<String, String> mappings) {
 
         List<Object> sfMetrics = getList(sourceData, SEMANTIC_CALCULATED_MEASUREMENTS);
@@ -105,9 +141,9 @@ public class MetricMappingHandler implements PipelineStep {
 
         outputData.putAll(mappedData);
 
-        List<Object> osiMetrics = getList(outputData, METRICS);
-        if (osiMetrics != null) {
-            wrapExpressions(sfMetrics, osiMetrics);
+        List<Object> ossieMetrics = getList(outputData, METRICS);
+        if (ossieMetrics != null) {
+            wrapExpressions(sfMetrics, ossieMetrics);
         }
 
         // Store unmapped SF properties in custom_extensions
@@ -119,18 +155,48 @@ public class MetricMappingHandler implements PipelineStep {
 
 
     /**
+     * Compiles each metric to Tua after fields have been mapped. Binding checks both
+     * the OSI declarations and the actual emitted fields, including their types.
+     */
+    private void unwrapExpressions(List<Object> ossieMetrics, List<Object> sfMetrics,
+                                   Map<String, Object> sourceData, Map<String, Object> outputData) {
+        if (ossieMetrics.size() != sfMetrics.size()) {
+            throw new ConversionException("Metric export count differs from declared metrics: "
+                    + streamMaps(ossieMetrics).map(metric -> getString(metric, NAME)).toList());
+        }
+        MetricFieldResolver resolver = new MetricFieldResolver(sourceData, outputData);
+        for (int i = 0; i < ossieMetrics.size(); i++) {
+            Map<String, Object> ossieMetric = asMap(ossieMetrics.get(i));
+            Map<String, Object> sfMetric = asMap(sfMetrics.get(i));
+            MetricExpressionTranslator.Result translated =
+                    MetricExpressionTranslator.translate(ossieMetric, resolver);
+            sfMetric.put(EXPRESSION, translated.expression());
+            // Exact Salesforce dataType restored from custom_extensions (e.g. "Currency")
+            // wins over the Tua compiler's derived type.
+            sfMetric.putIfAbsent(DATA_TYPE, translated.dataType());
+            sfMetric.put("syntax", "Tua");
+            sfMetric.put("aggregationType", "UserAgg");
+        }
+    }
+
+    /**
      * Wraps expressions for SF→Ossie conversion.
      */
-    private void wrapExpressions(List<Object> sfMetrics, List<Object> osiMetrics) {
-        for (int i = 0; i < sfMetrics.size() && i < osiMetrics.size(); i++) {
+    private void wrapExpressions(List<Object> sfMetrics, List<Object> ossieMetrics) {
+        for (int i = 0; i < sfMetrics.size() && i < ossieMetrics.size(); i++) {
             Map<String, Object> sfMetric = asMap(sfMetrics.get(i));
-            Map<String, Object> osiMetric = asMap(osiMetrics.get(i));
+            Map<String, Object> ossieMetric = asMap(ossieMetrics.get(i));
 
             // Get expression from SF metric
             String expressionValue = getString(sfMetric, EXPRESSION);
             if (expressionValue != null) {
                 // Wrap in Ossie dialect structure
-                osiMetric.put(EXPRESSION, wrapExpression(expressionValue));
+                ossieMetric.put(EXPRESSION, wrapExpression(expressionValue));
+            }
+
+            String datatype = SalesforceDataTypeMapper.toOssie(getString(sfMetric, DATA_TYPE));
+            if (datatype != null) {
+                ossieMetric.put(OSSIE_DATATYPE, datatype);
             }
         }
     }
