@@ -25,7 +25,9 @@ import yaml
 
 from ossie_bigquery.converter import (
     OsiConversionError,
+    OssieConversionError,
     convert_osi_to_lookml,
+    convert_ossie_to_lookml,
     _convert_field,
     _convert_metric,
     _convert_relationships,
@@ -44,9 +46,9 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _wrap_osi(model_dict):
+def _wrap_ossie(model_dict):
     return yaml.dump(
-        {"version": "0.2.0.dev0", "semantic_model": [model_dict]},
+        {"version": "0.2.0.dev0", **model_dict},
         default_flow_style=False,
     )
 
@@ -80,28 +82,32 @@ def _minimal_model(**overrides):
 
 class TestEnvelope:
     def test_rejects_wrong_version(self):
-        bad = yaml.dump({"version": "0.0.0", "semantic_model": [_minimal_model()]})
-        with pytest.raises(OsiConversionError, match="Unsupported OSI"):
-            convert_osi_to_lookml(bad)
+        bad = yaml.dump({"version": "0.0.0", **_minimal_model()})
+        with pytest.raises(OssieConversionError, match="Unsupported Ossie"):
+            convert_ossie_to_lookml(bad)
 
     def test_rejects_non_mapping_root(self):
-        with pytest.raises(OsiConversionError, match="expected a mapping"):
-            convert_osi_to_lookml("- just\n- a\n- list\n")
+        with pytest.raises(OssieConversionError, match="expected a mapping"):
+            convert_ossie_to_lookml("- just\n- a\n- list\n")
 
-    def test_rejects_empty_semantic_model(self):
-        bad = yaml.dump({"version": "0.2.0.dev0", "semantic_model": []})
-        with pytest.raises(OsiConversionError, match="non-empty list"):
-            convert_osi_to_lookml(bad)
+    def test_rejects_legacy_semantic_model_wrapper(self):
+        bad = yaml.dump({"version": "0.2.0.dev0", "semantic_model": [_minimal_model()]})
+        with pytest.raises(OssieConversionError, match="Legacy 'semantic_model'"):
+            convert_ossie_to_lookml(bad)
 
-    def test_multiple_models_warns(self):
-        payload = yaml.dump(
-            {
-                "version": "0.2.0.dev0",
-                "semantic_model": [_minimal_model(), _minimal_model(name="second")],
-            }
-        )
-        with pytest.warns(UserWarning, match="only the first"):
-            convert_osi_to_lookml(payload)
+    def test_rejects_root_dialects(self):
+        bad = yaml.dump({"version": "0.2.0.dev0", "dialects": ["ANSI_SQL"], **_minimal_model()})
+        with pytest.raises(OssieConversionError, match="Root dialects"):
+            convert_ossie_to_lookml(bad)
+
+    def test_version_not_reported_as_dropped(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            convert_ossie_to_lookml(_wrap_ossie(_minimal_model()))
+
+    def test_legacy_names_are_aliases(self):
+        assert OsiConversionError is OssieConversionError
+        assert convert_osi_to_lookml is convert_ossie_to_lookml
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +157,7 @@ class TestExtractExpression:
             assert _extract_expression(expr, "x") is None
 
     def test_missing_expression_raises(self):
-        with pytest.raises(OsiConversionError, match="Missing or malformed"):
+        with pytest.raises(OssieConversionError, match="Missing or malformed"):
             _extract_expression(None, "x")
 
 
@@ -269,7 +275,7 @@ class TestRelationships:
                 "to_columns": ["y", "z"],
             }
         ]
-        with pytest.raises(OsiConversionError, match="same length"):
+        with pytest.raises(OssieConversionError, match="same length"):
             _convert_relationships(rels, [{"name": "a"}, {"name": "b"}])
 
 
@@ -296,13 +302,16 @@ class TestEntityDescription:
 
 class TestEndToEnd:
     def test_bigquery_fixture_round(self):
-        osi_yaml = (FIXTURES / "osi_bigquery_example.yaml").read_text()
+        ossie_yaml = (FIXTURES / "ossie_bigquery_example.yaml").read_text()
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            out = convert_osi_to_lookml(osi_yaml)
+            out = convert_ossie_to_lookml(ossie_yaml)
         # Views for both datasets.
         assert "view: orders {" in out
         assert "view: customers {" in out
+        # Dataset description (plus synonyms) is emitted as a description.
+        assert 'description: "Customer orders (synonyms: purchases, sales)"' in out
+        assert "label:" not in out
         # BigQuery dialect preferred for the normalized email field.
         assert "SAFE_CAST(LOWER(email) AS STRING)" in out
         # Backtick-quoted BigQuery table reference.
@@ -323,6 +332,6 @@ class TestEndToEnd:
             pytest.skip("TPC-DS example not found")
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            out = convert_osi_to_lookml(tpcds.read_text())
+            out = convert_ossie_to_lookml(tpcds.read_text())
         assert "view: store_sales {" in out
         assert "explore:" in out
