@@ -93,12 +93,29 @@ public class MetricMappingHandler implements PipelineStep {
 
         outputData.putAll(mappedData);
 
+        customExtensionHandler.restoreCustomExtensionsAtLevel(outputData, sourceData, Level.METRICS);
+
         List<Object> sfMetrics = getList(outputData, SEMANTIC_CALCULATED_MEASUREMENTS);
         if (sfMetrics != null) {
             unwrapExpressions(ossieMetrics, sfMetrics, sourceData, outputData);
+            applyDefaults(sfMetrics);
         } else if (!ossieMetrics.isEmpty()) {
             throw new ConversionException("Metric '" + getString(asMap(ossieMetrics.get(0)), NAME)
                     + "': metric mappings produced no calculated measurements");
+        }
+    }
+
+    /**
+     * Ossie metrics have no label field; Salesforce requires one. Default it to apiName,
+     * matching DatasetMappingHandler/SemanticModelMappingHandler, unless custom_extensions
+     * already restored an exact Salesforce label.
+     */
+    private void applyDefaults(List<Object> sfMetrics) {
+        for (Object sfMetricObj : sfMetrics) {
+            Map<String, Object> sfMetric = asMap(sfMetricObj);
+            if (!sfMetric.containsKey(LABEL) && sfMetric.containsKey(API_NAME)) {
+                sfMetric.put(LABEL, getString(sfMetric, API_NAME));
+            }
         }
     }
 
@@ -154,7 +171,9 @@ public class MetricMappingHandler implements PipelineStep {
             MetricExpressionTranslator.Result translated =
                     MetricExpressionTranslator.translate(ossieMetric, resolver);
             sfMetric.put(EXPRESSION, translated.expression());
-            sfMetric.put(DATA_TYPE, translated.dataType());
+            // Exact Salesforce dataType restored from custom_extensions (e.g. "Currency")
+            // wins over the Tua compiler's derived type.
+            sfMetric.putIfAbsent(DATA_TYPE, translated.dataType());
             sfMetric.put("syntax", "Tua");
             sfMetric.put("aggregationType", "UserAgg");
         }
