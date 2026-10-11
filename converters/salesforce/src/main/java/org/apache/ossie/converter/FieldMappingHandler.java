@@ -327,7 +327,7 @@ public class FieldMappingHandler implements PipelineStep {
 
                 customExtensionHandler.restoreSalesforceCustomExtension(calcDim, ossieField);
 
-                applyOssieDatatype(calcDim, ossieField);
+                applyOssieDatatype(calcDim, ossieField, FieldType.CALCULATED_DIMENSION);
 
                 applyFieldDefaults(calcDim, FieldType.CALCULATED_DIMENSION);
 
@@ -342,7 +342,7 @@ public class FieldMappingHandler implements PipelineStep {
 
                 customExtensionHandler.restoreSalesforceCustomExtension(sfField, ossieField);
 
-                applyOssieDatatype(sfField, ossieField);
+                applyOssieDatatype(sfField, ossieField, fieldType);
 
                 applyFieldDefaults(sfField, fieldType);
 
@@ -606,7 +606,8 @@ public class FieldMappingHandler implements PipelineStep {
      * restored from custom_extensions. Exact extension data wins to preserve
      * Salesforce-specific distinctions such as Email and Currency.
      */
-    private void applyOssieDatatype(Map<String, Object> sfField, Map<String, Object> ossieField) {
+    private void applyOssieDatatype(
+            Map<String, Object> sfField, Map<String, Object> ossieField, FieldType fieldType) {
         String ossieDatatype = getString(ossieField, OSSIE_DATATYPE);
         String exactSalesforceDataType = getString(sfField, DATA_TYPE);
         String mappedSalesforceDataType = SalesforceDataTypeMapper.toSalesforce(ossieDatatype);
@@ -642,9 +643,10 @@ public class FieldMappingHandler implements PipelineStep {
         if (mappedSalesforceDataType == null) {
             logger.warn(
                     "Field '{}' has Ossie datatype '{}' with no safe Salesforce mapping; "
-                            + "falling back to the default dataType for its role",
+                            + "exporting it as '{}', the default dataType for its role",
                     getString(ossieField, NAME),
-                    ossieDatatype);
+                    ossieDatatype,
+                    defaultDataType(fieldType));
             return;
         }
         sfField.put(DATA_TYPE, mappedSalesforceDataType);

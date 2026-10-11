@@ -19,16 +19,22 @@
 
 package org.apache.ossie;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.ossie.converter.Converter;
 import org.apache.ossie.converter.ConverterFactory;
 import org.apache.ossie.converter.ConversionDirection;
 import org.apache.ossie.converter.CustomExtensionHandler;
+import org.apache.ossie.converter.FieldMappingHandler;
 import org.apache.ossie.validator.SchemaValidator;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 import org.apache.ossie.converter.pipeline.DirectionConfig;
 import org.apache.ossie.converter.pipeline.HandlerFactory;
 import org.apache.ossie.converter.pipeline.PipelineConfig;
@@ -934,6 +940,44 @@ class OssieToSalesforceConverterTest {
 
         assertEquals("Text", dimensions.get(0).get("dataType"),
                 "a datatype with no safe Salesforce mapping should fall back, not be dropped");
+    }
+
+    @Test
+    void testTheFallbackDataTypeIsNamedInTheWarning() throws Exception {
+        // The fallback can change the field's meaning -- a Time measurement ships as
+        // Number -- so the warning has to say which dataType was chosen, not just that
+        // one was. Omitting it instead is not an option: the API rejects such a field.
+        String ossieModel = "version: 0.2.0.dev0\n"
+                + "name: Imported_Model\n"
+                + "datasets:\n"
+                + "- name: Orders\n"
+                + "  source: Orders__dll\n"
+                + "  fields:\n"
+                + "  - name: handling_time\n"
+                + "    datatype: Time\n"
+                + "    expression:\n"
+                + "      dialects:\n"
+                + "      - dialect: ANSI_SQL\n"
+                + "        expression: handling_time\n";
+
+        Logger fieldLogger = (Logger) LoggerFactory.getLogger(FieldMappingHandler.class);
+        ListAppender<ILoggingEvent> warnings = new ListAppender<>();
+        warnings.start();
+        fieldLogger.addAppender(warnings);
+        try {
+            converter.convert(ossieModel);
+        } finally {
+            fieldLogger.detachAppender(warnings);
+        }
+
+        String reported = warnings.list.stream()
+                .filter(event -> event.getLevel() == Level.WARN)
+                .map(ILoggingEvent::getFormattedMessage)
+                .filter(message -> message.contains("handling_time"))
+                .findFirst()
+                .orElse("");
+        assertTrue(reported.contains("Number"),
+                "the warning should name the dataType the field was exported as: " + reported);
     }
 
     @Test
