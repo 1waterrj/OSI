@@ -46,6 +46,7 @@ public final class ConverterConstants {
     public static final String DATASETS = "datasets";
     public static final String FIELDS = "fields";
     public static final String METRICS = "metrics";
+    public static final String PRIMARY_KEY = "primary_key";
 
     // Salesforce semantic model structure
     public static final String SEMANTIC_DATA_OBJECTS = "semanticDataObjects";

@@ -942,6 +942,80 @@ class OssieToSalesforceConverterTest {
                 "a datatype with no safe Salesforce mapping should fall back, not be dropped");
     }
 
+    /**
+     * Builds a model whose Customers dataset carries a primary key and joins Orders to it
+     * on that key column. A Snowflake semantic view names a key column in
+     * {@code primary_key} and nowhere else, which is the case this fixture covers unless
+     * {@code declareTheKeyAsAFieldToo} also puts it among the fields.
+     */
+    private static String ossieModelWithAPrimaryKey(boolean declareTheKeyAsAFieldToo) {
+        return "version: 0.2.0.dev0\n"
+                + "name: Imported_Model\n"
+                + "datasets:\n"
+                + "- name: Customers\n"
+                + "  source: Customers__dll\n"
+                + "  primary_key:\n"
+                + "  - customer_id\n"
+                + "  fields:\n"
+                + (declareTheKeyAsAFieldToo ? ossieDimension("customer_id") : "")
+                + ossieDimension("name")
+                + "- name: Orders\n"
+                + "  source: Orders__dll\n"
+                + "  fields:\n"
+                + ossieDimension("customer_id")
+                + "relationships:\n"
+                + "- name: Orders_Customers\n"
+                + "  from: Orders\n"
+                + "  to: Customers\n"
+                + "  from_columns: [customer_id]\n"
+                + "  to_columns: [customer_id]\n";
+    }
+
+    private static String ossieDimension(String name) {
+        return "  - name: " + name + "\n"
+                + "    dimension: {}\n"
+                + "    expression:\n"
+                + "      dialects:\n"
+                + "      - dialect: ANSI_SQL\n"
+                + "        expression: " + name + "\n";
+    }
+
+    private static List<Map<String, Object>> dimensionsOf(Map<String, Object> sfModel, String apiName) {
+        Map<String, Object> dataObject = ((List<Map<String, Object>>) sfModel.get("semanticDataObjects")).stream()
+                .filter(d -> apiName.equals(d.get("apiName")))
+                .findFirst()
+                .orElseThrow();
+        return (List<Map<String, Object>>) dataObject.get("semanticDimensions");
+    }
+
+    @Test
+    void testPrimaryKeyColumnIsExportedSoRelationshipsCanJoinOnIt() throws Exception {
+        // Salesforce resolves a join criterion against the declared semantic fields, not
+        // against the table's columns, so a key column that reaches export only through
+        // primary_key takes every relationship joining on it down with it.
+        List<String> results = converter.convert(ossieModelWithAPrimaryKey(false));
+        Map<String, Object> sfModel = jsonMapper.readValue(results.get(0), new TypeReference<Map<String, Object>>() {});
+
+        assertTrue(dimensionsOf(sfModel, "Customers").stream()
+                        .anyMatch(d -> "customer_id".equals(d.get("apiName"))),
+                "a primary key column should be exported as a dimension");
+        assertEquals(1, ((List<Map<String, Object>>) sfModel.get("semanticRelationships")).size(),
+                "the relationship joining on the primary key should survive export");
+    }
+
+    @Test
+    void testPrimaryKeyColumnAlreadyDeclaredAsAFieldIsExportedOnce() throws Exception {
+        // A document is free to declare the key column as a field as well, and the field
+        // carries the description and datatype the primary key entry has no room for.
+        List<String> results = converter.convert(ossieModelWithAPrimaryKey(true));
+        Map<String, Object> sfModel = jsonMapper.readValue(results.get(0), new TypeReference<Map<String, Object>>() {});
+
+        assertEquals(1, dimensionsOf(sfModel, "Customers").stream()
+                        .filter(d -> "customer_id".equals(d.get("apiName")))
+                        .count(),
+                "a primary key column already declared as a field should not be exported twice");
+    }
+
     @Test
     void testTheFallbackDataTypeIsNamedInTheWarning() throws Exception {
         // The fallback can change the field's meaning -- a Time measurement ships as

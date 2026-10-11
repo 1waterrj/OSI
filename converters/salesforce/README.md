@@ -190,6 +190,7 @@ ossieToSf.convert(Paths.get("input/model.yaml"), Paths.get("output/"));
 | Calculated Tableau fields | `semanticCalculatedDimensions[]` through the existing expression-analysis path |
 | `expression.dialects[].expression` | `dataObjectFieldName` |
 | Field `datatype` | Field `dataType` when a safe mapping exists |
+| `datasets[].primary_key` | A `semanticDimensions[]` entry for each key column no field declares |
 | `relationships[]` | `semanticRelationships[]` |
 | `from_columns` + `to_columns` | `criteria[]` |
 | `metrics[]` | Validated Tua expressions in `semanticCalculatedMeasurements[]` |
@@ -281,6 +282,12 @@ dimensions.
 ### Relationship Handling
 
 **Unsupported relationships** (containing Formula or SemanticField types) are stored in `custom_extensions` at the model level rather than being converted to Ossie relationships.
+
+**Primary key columns** are exported as dimensions. Salesforce resolves a join
+criterion against the declared semantic fields rather than against the table's
+columns, and a dataset is free to name a key column in `primary_key` and nowhere
+else, so a key column no field declares would otherwise take every relationship
+joining on it down with it.
 
 ### Metric expressions
 

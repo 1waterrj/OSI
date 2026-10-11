@@ -279,6 +279,47 @@ public class FieldMappingHandler implements PipelineStep {
     }
 
     /**
+     * Returns the dataset's fields followed by a dimension field for every primary key
+     * column none of them already declares. Salesforce refuses a relationship whose join
+     * column is not a declared semantic field, and a dataset is free to name a key column
+     * only in {@code primary_key} -- a Snowflake semantic view exports its keys that way --
+     * so a key left unexported takes every relationship joining on it down with it.
+     */
+    private List<Object> fieldsCoveringPrimaryKey(Map<String, Object> ossieDataset) {
+        List<Object> ossieFields = getList(ossieDataset, FIELDS);
+        List<Object> covered = new ArrayList<>(ossieFields == null ? List.of() : ossieFields);
+
+        Set<String> declaredNames = new HashSet<>();
+        for (Object field : covered) {
+            declaredNames.add(getString(asMap(field), NAME));
+        }
+
+        List<Object> primaryKey = getList(ossieDataset, PRIMARY_KEY);
+        if (primaryKey != null) {
+            for (Object columnObj : primaryKey) {
+                String column = String.valueOf(columnObj);
+                if (declaredNames.add(column)) {
+                    covered.add(primaryKeyField(column));
+                }
+            }
+        }
+
+        return covered;
+    }
+
+    /**
+     * Builds the Ossie field a primary key column would have had, so that it travels the
+     * same mapping path as a declared one and picks up the same defaults.
+     */
+    private Map<String, Object> primaryKeyField(String column) {
+        Map<String, Object> ossieField = new LinkedHashMap<>();
+        ossieField.put(NAME, column);
+        ossieField.put(DIMENSION, new LinkedHashMap<>());
+        ossieField.put(EXPRESSION, wrapExpression(column));
+        return ossieField;
+    }
+
+    /**
      * Processes all fields for a single dataset.
      *
      * <p><b>Routing Logic:</b>
@@ -295,8 +336,8 @@ public class FieldMappingHandler implements PipelineStep {
      */
     private void processFieldsForDataset(
             Map<String, Object> ossieDataset, Map<String, Object> sfDataObject, Map<String, Object> outputData) {
-        List<Object> ossieFields = getList(ossieDataset, FIELDS);
-        if (ossieFields == null) {
+        List<Object> ossieFields = fieldsCoveringPrimaryKey(ossieDataset);
+        if (ossieFields.isEmpty()) {
             return;
         }
 
