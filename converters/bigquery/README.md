@@ -61,11 +61,19 @@ uv run pytest
 | `Integer`, `Decimal`, `Float` | `dimension` `type: number` |
 | `Boolean` | `dimension` `type: yesno` |
 | `Date` | `dimension_group` `datatype: date`, timeframes `[raw, date, week, month, quarter, year]` |
-| `DateTime` | `dimension_group` `datatype: datetime`, timeframes `[raw, time, date, week, month, quarter, year]` |
+| `DateTime` | `dimension_group` `datatype: datetime` with `convert_tz: no` (civil time carries no zone, so Looker must not shift it), timeframes `[raw, time, date, week, month, quarter, year]` |
 | `DateTimeTz` | `dimension_group` `datatype: timestamp`, same timeframes |
 | `Opaque`, unrecognized | `type: string` with a warning |
 
 `is_time` is a role marker in Ossie, so an `is_time` field with a scalar `datatype` (TPC-DS marks the integer `d_year` this way) stays a plain dimension; only a temporal `datatype`, or `is_time` with no `datatype` at all, produces a `dimension_group`. The latter is reported per field, because Looker will assume a `TIMESTAMP` column.
+
+### Names
+
+LookML needs every view, field, measure and join name to be a valid identifier and unique within its scope, so the converter checks that up front instead of emitting a project that fails to load:
+
+- dataset, field, metric and relationship names must be valid LookML names, and duplicates within their scope are an error;
+- a `dimension_group` reserves the names of the fields it expands to (`created_date`, `created_raw`, …), so the shortened group name is only used when none of those collide with another field;
+- a metric named like a field of its home view is emitted as `<name>_measure` with a warning; the hidden helper measures and the synthetic composite `primary_key` dimension pick names no field uses.
 
 ### Expressions
 
@@ -100,12 +108,16 @@ For each field and metric the converter prefers the `BIGQUERY` dialect expressio
 
 The converter also runs on `ANSI_SQL`-only models — see the canonical [TPC-DS example](../../examples/tpcds_semantic_model.yaml), which the test suite converts and parses back with [lkml](https://github.com/joshtemple/lkml) to check the output is well-formed LookML.
 
+## Input validation
+
+Malformed input is reported as an `OssieConversionError` naming the entity (`Relationship 'o2c': 'from_columns' must contain only non-empty strings`), which the CLI prints as `Error: …` with exit status 1. That covers unparseable YAML, a container of the wrong type (a dataset, field, metric, relationship or dialect entry that is not a mapping; `datasets`, `fields`, `primary_key` or `from_columns` that are not lists), missing names, and unreadable input or output paths.
+
 ## Limitations
 
 - **Looker project layout**: the output is one document. Looker expects views in `.view.lkml` files and explores in a `.model.lkml` file that also declares `connection` and `include`; the generated sections are labelled accordingly.
 - **Join type**: all joins are `left_outer` / `many_to_one`, which is what an Ossie relationship (many-side `from`, one-side `to`) declares. One-to-one and one-to-many joins would need extra information the spec does not carry.
 - **Window functions** in metrics cannot be LookML measures (see above).
-- **Dropped constructs**: `custom_extensions`, model-level `label`, and relationship-level `ai_context` have no LookML counterpart and are dropped with warnings. Field `label` is emitted; dataset `description` is kept as a comment and on the explore.
+- **Dropped constructs**: `custom_extensions`, `unique_keys`, relationship-level `ai_context`, and `ai_context` keys other than `synonyms` and `instructions` (such as `examples`) have no LookML counterpart and are dropped with a warning naming the entity. Field `label` is emitted; `description` plus `ai_context.instructions` and synonyms form the LookML description; dataset descriptions are kept as a comment and on the explore.
 
 ## Roadmap
 

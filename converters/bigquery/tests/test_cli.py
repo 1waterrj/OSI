@@ -99,3 +99,17 @@ class TestErrors:
         with pytest.raises(SystemExit):
             cli.main(["-i", str(bad), "-o", str(out)])
         assert not out.exists()
+
+    def test_a_missing_input_file_is_reported_not_raised(self, tmp_path, capsys):
+        with pytest.raises(SystemExit) as excinfo:
+            cli.main(["-i", str(tmp_path / "nope.yaml"), "-o", str(tmp_path / "out.lkml")])
+        assert excinfo.value.code == 1
+        assert capsys.readouterr().err.startswith("Error: ")
+
+    def test_invalid_yaml_is_reported_not_raised(self, tmp_path, capsys):
+        bad = tmp_path / "bad.yaml"
+        bad.write_text("name: [unclosed\nversion: x")
+        with pytest.raises(SystemExit) as excinfo:
+            cli.main(["-i", str(bad), "-o", str(tmp_path / "out.lkml")])
+        assert excinfo.value.code == 1
+        assert "Error: Invalid Ossie YAML" in capsys.readouterr().err

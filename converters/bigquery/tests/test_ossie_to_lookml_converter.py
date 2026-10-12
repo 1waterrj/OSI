@@ -738,3 +738,126 @@ class TestEndToEnd:
         explore = _block(out, "explore: store_sales")
         for target in ("date_dim", "item", "customer", "store"):
             assert f"join: {target} {{" in explore
+
+
+# ---------------------------------------------------------------------------
+# The review's principles applied to the rest of the input: malformed input
+# is a clean OssieConversionError, every emitted name is a unique valid LookML
+# name, and nothing is dropped without a warning naming the entity.
+# ---------------------------------------------------------------------------
+
+class TestInputValidation:
+    def test_invalid_yaml_is_a_conversion_error(self):
+        with pytest.raises(OssieConversionError, match="Invalid Ossie YAML"):
+            convert_ossie_to_lookml("name: [unclosed\nversion: x")
+
+    @pytest.mark.parametrize(
+        "model, message",
+        [
+            ({"datasets": ["orders"]}, "Dataset #1.*mapping"),
+            ({"datasets": "orders"}, "'datasets' must be a list"),
+            ({"datasets": [{"name": "t", "source": "s", "fields": [42]}]}, "Dataset 't'.*field #1.*mapping"),
+            ({"datasets": [{"name": "t", "source": "s", "fields": {"a": 1}}]}, "Dataset 't'.*'fields' must be a list"),
+            ({"datasets": [{"name": "t", "source": "s", "primary_key": "id"}]}, "Dataset 't'.*'primary_key' must be a list"),
+            ({"datasets": [{"name": "t", "source": "s", "primary_key": [1]}]}, "Dataset 't'.*'primary_key'.*non-empty strings"),
+            ({"datasets": [_dataset("t", [])], "metrics": [None]}, "Metric #1.*mapping"),
+            ({"datasets": [_dataset("t", [])], "relationships": ["x"]}, "Relationship #1.*mapping"),
+            ({"datasets": [_dataset("t", [{"name": "f", "expression": {"dialects": ["ANSI_SQL"]}}])]}, "Field 't.f'.*dialect #1.*mapping"),
+            ({"datasets": [_dataset("t", [{"name": "f", "expression": {"dialects": "x"}}])]}, "Field 't.f'.*'dialects' must be a list"),
+        ],
+    )
+    def test_wrongly_typed_containers_are_conversion_errors(self, model, message):
+        doc = yaml.dump({"version": "0.2.0.dev0", "name": "m", **model})
+        with pytest.raises(OssieConversionError, match=message):
+            convert_ossie_to_lookml(doc)
+
+    def test_relationship_columns_must_be_strings(self):
+        model = _model([ORDERS, CUSTOMERS], [_rel("o2c", "orders", "customers", [1], ["id"])])
+        with pytest.raises(OssieConversionError, match="Relationship 'o2c'.*from_columns.*non-empty strings"):
+            convert_ossie_to_lookml(model)
+
+
+class TestNameSafety:
+    def test_field_name_must_be_a_valid_lookml_name(self):
+        with pytest.raises(OssieConversionError, match="Field 't.order id'.*LookML"):
+            convert_ossie_to_lookml(_model([_dataset("t", [_field("order id")])]))
+
+    def test_duplicate_field_names_raise(self):
+        with pytest.raises(OssieConversionError, match="Dataset 't'.*duplicate field name 'a'"):
+            convert_ossie_to_lookml(_model([_dataset("t", [_field("a"), _field("a")])]))
+
+    def test_duplicate_dataset_names_raise(self):
+        with pytest.raises(OssieConversionError, match="Duplicate dataset name 't'"):
+            convert_ossie_to_lookml(_model([_dataset("t", [_field("a")]), _dataset("t", [_field("b")])]))
+
+    def test_duplicate_metric_names_raise(self):
+        model = _model([ORDERS], metrics=[_metric("m", "SUM(orders.amount)"), _metric("m", "COUNT(*)")])
+        with pytest.raises(OssieConversionError, match="Duplicate metric name 'm'"):
+            convert_ossie_to_lookml(model)
+
+    def test_duplicate_relationship_names_raise(self):
+        rels = [_rel("r", "orders", "customers", ["customer_id"], ["id"])] * 2
+        with pytest.raises(OssieConversionError, match="Duplicate relationship name 'r'"):
+            convert_ossie_to_lookml(_model([ORDERS, CUSTOMERS], rels))
+
+    def test_dimension_group_avoids_timeframe_collisions_with_fields(self):
+        # `created_timestamp` would become group `created`, which exposes
+        # `created_date`; that already exists as a plain field.
+        fields = [_field("created_date"), _field("created_timestamp", datatype="DateTimeTz")]
+        out = _convert(_model([_dataset("t", fields)]))
+        assert "dimension: created_date {" in out
+        assert "dimension_group: created_timestamp {" in out
+        assert "dimension_group: created {" not in out
+
+    def test_measure_colliding_with_a_field_is_renamed_with_warning(self):
+        orders = _dataset("orders", [_field("id"), _field("amount")], primary_key=["id"])
+        model = _model([orders], metrics=[_metric("amount", "SUM(orders.amount)")])
+        with pytest.warns(UserWarning, match="Metric 'amount'.*clashes with a field.*'amount_measure'"):
+            out = convert_ossie_to_lookml(model)
+        assert "measure: amount_measure {" in out
+        assert "measure: amount {" not in out
+
+    def test_helper_measure_names_avoid_existing_fields(self):
+        orders = _dataset("orders", [_field("id"), _field("amount"), _field("aov_sum_1")], primary_key=["id"])
+        model = _model([orders], metrics=[_metric("aov", "SUM(orders.amount) / COUNT(DISTINCT orders.id)")])
+        out = _convert(model)
+        assert "measure: aov_sum_1 {" not in out
+        assert "measure: aov_sum_2 {" in out
+        assert "sql: ${aov_sum_2} / ${aov_count_distinct_2} ;;" in _block(out, "measure: aov")
+
+    def test_synthetic_primary_key_avoids_a_field_named_primary_key(self):
+        ds = _dataset("t", [_field("primary_key"), _field("b")], primary_key=["primary_key", "b"])
+        out = _convert(_model([ds]))
+        assert "dimension: pk {" in out
+        assert "primary_key: yes" in _block(out, "dimension: pk")
+
+
+class TestNotSilentlyDropped:
+    def test_unique_keys_are_reported(self):
+        ds = _dataset("t", [_field("a")], primary_key=["a"])
+        ds["unique_keys"] = [["a"]]
+        with pytest.warns(UserWarning, match="dataset 't'.*unique_keys"):
+            convert_ossie_to_lookml(_model([ds]))
+
+    def test_entity_instructions_join_the_description(self):
+        entity = {"description": "Orders", "ai_context": {"instructions": "Use for sales.", "synonyms": ["purchases"]}}
+        assert _entity_description(entity) == "Orders Use for sales. (synonyms: purchases)"
+
+    def test_other_ai_context_keys_are_reported(self):
+        field = _field("a")
+        field["ai_context"] = {"examples": ["What sold last week?"]}
+        with pytest.warns(UserWarning, match="Field 't.a'.*ai_context.examples"):
+            convert_ossie_to_lookml(_model([_dataset("t", [field])]))
+
+
+class TestTimezones:
+    def test_civil_datetime_does_not_convert_timezone(self):
+        # Ossie DateTime (and BigQuery DATETIME) carry no timezone; Looker's
+        # default convert_tz would shift them.
+        view = _block(_convert(_model([_dataset("t", [_field("f", datatype="DateTime")])])), "view: t")
+        assert "convert_tz: no" in _block(view, "dimension_group: f")
+
+    @pytest.mark.parametrize("datatype", ["Date", "DateTimeTz"])
+    def test_instants_and_dates_keep_looker_defaults(self, datatype):
+        view = _block(_convert(_model([_dataset("t", [_field("f", datatype=datatype)])])), "view: t")
+        assert "convert_tz" not in _block(view, "dimension_group: f")

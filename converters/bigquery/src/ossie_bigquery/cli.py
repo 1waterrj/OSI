@@ -39,17 +39,15 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
-    with open(args.input, "r") as f:
-        ossie_yaml_str = f.read()
-
     try:
+        with open(args.input, "r") as f:
+            ossie_yaml_str = f.read()
         lookml_str = convert_ossie_to_lookml(ossie_yaml_str)
-    except OssieConversionError as e:
+        with open(args.output, "w") as f:
+            f.write(lookml_str)
+    except (OssieConversionError, OSError) as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
-
-    with open(args.output, "w") as f:
-        f.write(lookml_str)
 
     print(f"Converted {args.input} -> {args.output}")
 
