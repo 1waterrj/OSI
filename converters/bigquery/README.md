@@ -45,22 +45,74 @@ uv run pytest
 
 | Ossie construct | LookML output |
 |-----------------|---------------|
-| Ossie document (root `name`, `description`, `datasets`, …) | A single LookML document with a descriptive header |
-| `dataset` | `view` with `sql_table_name` (3-part sources are backtick-quoted as `` `project.dataset.table` ``; subquery sources become a `derived_table`); `description` (plus `ai_context` synonyms) becomes the view `description` |
-| `field` | `dimension` |
-| `field` with `dimension.is_time: true` | `dimension_group` with `type: time` and standard timeframes |
-| `metric` | `measure` (`type: number`) |
-| `relationship` | `explore` on the `from` dataset with a `join` (`relationship: many_to_one`, `left_outer`); composite keys produce an `AND`-joined `sql_on` |
+| Ossie document (root `name`, `description`, `datasets`, …) | One LookML document: a header comment, the views, then the explores (split into `.view.lkml` / `.model.lkml` files when checking into a Looker project) |
+| `dataset` | `view` with `sql_table_name` (3-part sources are backtick-quoted as `` `project.dataset.table` ``; subquery sources become a `derived_table`). The dataset `description` (plus `ai_context` synonyms) has no view-level parameter in LookML, so it is kept as a comment in the view and emitted as the explore `description` |
+| `dataset.primary_key` | `primary_key: yes` on the key dimension; composite keys (and keys over a `dimension_group`) become a hidden `primary_key` dimension that `CONCAT`s the `CAST(... AS STRING)` columns, the pattern Looker documents for composite keys |
+| `field` | `dimension` typed from `datatype` (see below), with `label` and `description` |
+| `field` with a temporal `datatype`, or `is_time: true` and no `datatype` | `dimension_group` with `type: time`, `datatype: date \| datetime \| timestamp`, and standard timeframes. A trailing `_date` / `_time` / `_datetime` / `_timestamp` is dropped from the group name (so `created_at`-style groups expose `created_date`, `created_month`, …) unless that would collide with another field |
+| `metric` | `measure` in the view of the dataset it aggregates (see below) |
+| `relationship` | `explore` on the many-side (`from`) dataset with `join`s (`relationship: many_to_one`, `type: left_outer`); `sql_on` joins `${view.field}` references, composite keys are `AND`-ed |
+
+### Data types
+
+| Ossie `datatype` | LookML |
+|------------------|--------|
+| `String`, `Time`, omitted | `dimension` `type: string` (LookML has no time-of-day type) |
+| `Integer`, `Decimal`, `Float` | `dimension` `type: number` |
+| `Boolean` | `dimension` `type: yesno` |
+| `Date` | `dimension_group` `datatype: date`, timeframes `[raw, date, week, month, quarter, year]` |
+| `DateTime` | `dimension_group` `datatype: datetime`, timeframes `[raw, time, date, week, month, quarter, year]` |
+| `DateTimeTz` | `dimension_group` `datatype: timestamp`, same timeframes |
+| `Opaque`, unrecognized | `type: string` with a warning |
+
+`is_time` is a role marker in Ossie, so an `is_time` field with a scalar `datatype` (TPC-DS marks the integer `d_year` this way) stays a plain dimension; only a temporal `datatype`, or `is_time` with no `datatype` at all, produces a `dimension_group`. The latter is reported per field, because Looker will assume a `TIMESTAMP` column.
+
+### Expressions
+
+Every field and metric expression is parsed with [sqlglot](https://github.com/tobymao/sqlglot) (BigQuery dialect) and its column references are rewritten to LookML substitutions:
+
+- a bare `column` becomes `${TABLE}.column` (a physical column of the view);
+- `dataset.column` becomes `${dataset.field}`, resolved through the fields the dataset exposes, so a join or metric on a time column lands on the `dimension_group`'s `_raw` timeframe rather than a name that no longer exists;
+- a reference to a dataset that is not in the model, or to a column no field exposes, is emitted as-is with a warning naming the field or metric.
+
+Expressions sqlglot cannot parse are emitted verbatim with a warning.
+
+### Measures
+
+A metric is placed in the view of the first dataset it qualifies a column with (`SUM(store_sales.ss_ext_sales_price)` lands in `store_sales`); a metric that only uses bare columns is placed in the one dataset that exposes them all. Anything else falls back to the first view with a warning that names the metric.
+
+- A single `SUM` / `AVG` / `MIN` / `MAX` over a row-level expression becomes a native `type: sum` / `average` / `min` / `max` measure; `COUNT(DISTINCT x)` becomes `count_distinct`; `COUNT(*)` becomes `type: count`.
+- Arithmetic over several aggregates (`SUM(a) / NULLIF(COUNT(DISTINCT b), 0)`) hoists each aggregate into a hidden native measure (`<metric>_sum_1`, `<metric>_count_distinct_2`, …) and emits the metric as `type: number` arithmetic over them, which keeps Looker's symmetric aggregates in play across joins.
+- Aggregates Looker cannot type natively (`COUNT(column)`, nested aggregates) and window functions are emitted as `type: number` with the qualified expression inline, with a warning; window functions will not run as a measure and need to be rewritten by hand.
+- A metric that references several datasets is emitted in the first one and warned about: it is only valid in explores that join the others.
+
+### Explores
+
+- Every dataset that is the `from` side of a relationship gets an explore. Joins follow the relationship graph transitively, breadth first: with `orders -> customers -> regions`, `explore: orders` joins both `customers` and `regions` (on `${customers.region_id} = ${regions.id}`).
+- Two relationships from the same dataset to the same target (`orders.billing_addr` and `orders.shipping_addr` both to `addresses`) are aliased with `join: <relationship name> { from: addresses … }`, so the relationship name must be a valid LookML name. Joins downstream of an alias are aliased as `<alias>_<dataset>` so each path keeps its own copy.
+- A dataset reachable by two different paths (a diamond) is joined once; the second path is skipped with a warning. Cycles are cut with a warning.
+- A dataset that takes part in no relationship gets a bare `explore: name {}` so it can still be queried; datasets that are only join targets do not get their own explore.
+- A join target with no `primary_key` is reported, since Looker needs one for symmetric aggregates on `many_to_one` joins.
 
 ## Dialect selection
 
-For each field and metric the converter prefers the `BIGQUERY` dialect expression and falls back to `ANSI_SQL`, consistent with the dialect-selection contract in [`../README.md`](../README.md). If neither is present, the field/metric is skipped with a warning.
+For each field and metric the converter prefers the `BIGQUERY` dialect expression, then `ANSI_SQL`, then `OSSIE_SQL_2026` (the portable Ossie dialect, which is ANSI-based), consistent with the dialect-selection contract in [`../README.md`](../README.md). If none is present, the field/metric is skipped with a warning.
 
-The converter also runs on `ANSI_SQL`-only models — see the canonical [TPC-DS example](../../examples/tpcds_semantic_model.yaml), which the test suite converts as-is.
+The converter also runs on `ANSI_SQL`-only models — see the canonical [TPC-DS example](../../examples/tpcds_semantic_model.yaml), which the test suite converts and parses back with [lkml](https://github.com/joshtemple/lkml) to check the output is well-formed LookML.
 
 ## Limitations
 
-- **Data types**: The optional Ossie `datatype` is not yet mapped, so dimensions are emitted as `type: string`. Numeric and key fields may need type refinement after generation.
-- **Measures**: Ossie metric expressions do not encode an aggregate type, so measures are emitted as `type: number` with the expression supplied verbatim. Model-level metrics are emitted into the first view; cross-dataset measures may need manual placement within an `explore`.
-- **Computed expressions**: Bare column references are qualified as `${TABLE}.column`. Computed expressions are emitted verbatim with a warning so column qualification can be confirmed.
-- **Dropped constructs**: `custom_extensions`, `label`, and relationship-level `ai_context` have no direct LookML counterpart and are dropped with warnings.
+- **Looker project layout**: the output is one document. Looker expects views in `.view.lkml` files and explores in a `.model.lkml` file that also declares `connection` and `include`; the generated sections are labelled accordingly.
+- **Join type**: all joins are `left_outer` / `many_to_one`, which is what an Ossie relationship (many-side `from`, one-side `to`) declares. One-to-one and one-to-many joins would need extra information the spec does not carry.
+- **Window functions** in metrics cannot be LookML measures (see above).
+- **Dropped constructs**: `custom_extensions`, model-level `label`, and relationship-level `ai_context` have no LookML counterpart and are dropped with warnings. Field `label` is emitted; dataset `description` is kept as a comment and on the explore.
+
+## Roadmap
+
+Things this converter does not do yet, in rough order of value:
+
+- **LookML to Ossie import**, so a Looker project can be exchanged like the Snowflake and dbt models can. The module is named `ossie_to_lookml.py` and the CLI split out into `cli.py` for that reason; an importer would live beside it as `lookml_to_ossie.py` and reuse `lkml` for parsing.
+- **`OSSIE_SQL_2026` as the primary source**: once the Ossie expression language settles, translating its portable functions (`DATE_TRUNC('month', d)` → `DATE_TRUNC(d, MONTH)`, `DATEADD` → `DATE_ADD`, …) to BigQuery with sqlglot would let models written only in the Ossie dialect convert without a hand-written `BIGQUERY` expression; sqlglot already does most of that transpilation.
+- **Explore-level descriptions and `ai_context`**: relationship and model `ai_context` could feed Looker's explore `description` or `sql_always_where`-style hints once Looker exposes a stable place for agent context.
+- **Vendor extension passthrough**: a `LOOKER` (or `BIGQUERY`) `custom_extensions` vendor could carry LookML-only settings such as `value_format`, `drill_fields`, `group_label` and `view_label` on round trips.
+- **Join cardinality**: if the spec grows a cardinality or join-type hint on relationships, map it to `relationship:` and `type:` instead of assuming `many_to_one` / `left_outer`.

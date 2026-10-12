@@ -17,63 +17,121 @@
 
 """Tests for the Ossie to LookML converter."""
 
+import re
 import warnings
 from pathlib import Path
 
+import lkml
 import pytest
 import yaml
 
-from ossie_bigquery.converter import (
-    OsiConversionError,
+from ossie_bigquery.ossie_to_lookml import (
     OssieConversionError,
-    convert_osi_to_lookml,
     convert_ossie_to_lookml,
-    _convert_field,
-    _convert_metric,
-    _convert_relationships,
     _convert_source,
     _entity_description,
     _extract_expression,
-    _is_time_dimension,
     _strip_time_suffix,
-    _to_lookml_sql,
 )
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
+TPCDS = Path(__file__).resolve().parents[3] / "examples" / "tpcds_semantic_model.yaml"
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _wrap_ossie(model_dict):
-    return yaml.dump(
-        {"version": "0.2.0.dev0", **model_dict},
-        default_flow_style=False,
-    )
+def _ansi(expr):
+    return {"dialects": [{"dialect": "ANSI_SQL", "expression": expr}]}
+
+
+def _field(name, expr=None, is_time=None, datatype=None, label=None, description=None):
+    field = {"name": name, "expression": _ansi(expr or name)}
+    if is_time is not None:
+        field["dimension"] = {"is_time": is_time}
+    if datatype is not None:
+        field["datatype"] = datatype
+    if label is not None:
+        field["label"] = label
+    if description is not None:
+        field["description"] = description
+    return field
+
+
+def _dataset(name, fields, source=None, primary_key=None):
+    dataset = {"name": name, "source": source or f"proj.sch.{name}", "fields": fields}
+    if primary_key is not None:
+        dataset["primary_key"] = primary_key
+    return dataset
+
+
+def _rel(name, from_ds, to_ds, from_cols, to_cols):
+    return {
+        "name": name,
+        "from": from_ds,
+        "to": to_ds,
+        "from_columns": from_cols,
+        "to_columns": to_cols,
+    }
+
+
+def _metric(name, expr, **extra):
+    return {"name": name, "expression": _ansi(expr), **extra}
+
+
+def _model(datasets, relationships=None, metrics=None, **extra):
+    model = {"version": "0.2.0.dev0", "name": "test_model", "datasets": datasets}
+    if relationships is not None:
+        model["relationships"] = relationships
+    if metrics is not None:
+        model["metrics"] = metrics
+    model.update(extra)
+    return yaml.dump(model, default_flow_style=False)
 
 
 def _minimal_model(**overrides):
     base = {
         "name": "test_model",
-        "datasets": [
-            {
-                "name": "my_table",
-                "source": "proj.dataset.tbl",
-                "fields": [
-                    {
-                        "name": "col1",
-                        "expression": {
-                            "dialects": [{"dialect": "ANSI_SQL", "expression": "col1"}]
-                        },
-                        "dimension": {"is_time": False},
-                    }
-                ],
-            }
-        ],
+        "datasets": [_dataset("my_table", [_field("col1", is_time=False)])],
     }
     base.update(overrides)
     return base
+
+
+def _wrap_ossie(model_dict):
+    return yaml.dump({"version": "0.2.0.dev0", **model_dict}, default_flow_style=False)
+
+
+def _convert(yaml_str):
+    """Converts, swallowing warnings (they are asserted on separately)."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return convert_ossie_to_lookml(yaml_str)
+
+
+def _block(out, header):
+    """Returns the text of the `<header> {` ... `}` block at its own indent."""
+    match = re.search(rf"^( *){re.escape(header)} \{{\n(.*?)^\1\}}", out, re.S | re.M)
+    assert match, f"no block '{header}' in:\n{out}"
+    return match.group(2)
+
+
+ORDERS = _dataset(
+    "orders",
+    [
+        _field("order_id", datatype="Integer"),
+        _field("customer_id", datatype="Integer"),
+        _field("amount", datatype="Decimal"),
+    ],
+    primary_key=["order_id"],
+)
+CUSTOMERS = _dataset(
+    "customers",
+    [_field("id", datatype="Integer"), _field("region_id", datatype="Integer")],
+    primary_key=["id"],
+)
+REGIONS = _dataset("regions", [_field("id", datatype="Integer")], primary_key=["id"])
 
 
 # ---------------------------------------------------------------------------
@@ -106,8 +164,11 @@ class TestEnvelope:
             convert_ossie_to_lookml(_wrap_ossie(_minimal_model()))
 
     def test_legacy_names_are_aliases(self):
-        assert OsiConversionError is OssieConversionError
-        assert convert_osi_to_lookml is convert_ossie_to_lookml
+        from ossie_bigquery import converter
+
+        assert converter.OsiConversionError is OssieConversionError
+        assert converter.convert_osi_to_lookml is convert_ossie_to_lookml
+        assert converter.convert_ossie_to_lookml is convert_ossie_to_lookml
 
 
 # ---------------------------------------------------------------------------
@@ -139,93 +200,308 @@ class TestConvertSource:
 
 class TestExtractExpression:
     def test_prefers_bigquery_over_ansi(self):
-        expr = {
+        expression = {
             "dialects": [
                 {"dialect": "ANSI_SQL", "expression": "LOWER(email)"},
                 {"dialect": "BIGQUERY", "expression": "SAFE_CAST(LOWER(email) AS STRING)"},
             ]
         }
-        assert _extract_expression(expr, "email") == "SAFE_CAST(LOWER(email) AS STRING)"
+        assert _extract_expression(expression, "f") == "SAFE_CAST(LOWER(email) AS STRING)"
 
     def test_falls_back_to_ansi(self):
-        expr = {"dialects": [{"dialect": "ANSI_SQL", "expression": "col"}]}
-        assert _extract_expression(expr, "col") == "col"
+        expression = {"dialects": [{"dialect": "ANSI_SQL", "expression": "x"}]}
+        assert _extract_expression(expression, "f") == "x"
+
+    def test_falls_back_to_ossie_sql_after_ansi(self):
+        expression = {
+            "dialects": [
+                {"dialect": "OSSIE_SQL_2026", "expression": "ossie_expr"},
+                {"dialect": "SNOWFLAKE", "expression": "snow_expr"},
+            ]
+        }
+        assert _extract_expression(expression, "f") == "ossie_expr"
 
     def test_unsupported_only_warns_and_skips(self):
-        expr = {"dialects": [{"dialect": "MDX", "expression": "[Measures].[X]"}]}
-        with pytest.warns(UserWarning, match="no BigQuery-compatible"):
-            assert _extract_expression(expr, "x") is None
+        expression = {"dialects": [{"dialect": "SNOWFLAKE", "expression": "x"}]}
+        with pytest.warns(UserWarning, match="Skipping"):
+            assert _extract_expression(expression, "f") is None
 
     def test_missing_expression_raises(self):
         with pytest.raises(OssieConversionError, match="Missing or malformed"):
-            _extract_expression(None, "x")
+            _extract_expression(None, "f")
 
 
 # ---------------------------------------------------------------------------
-# _to_lookml_sql
-# ---------------------------------------------------------------------------
-
-class TestToLookmlSql:
-    def test_bare_identifier_qualified(self):
-        assert _to_lookml_sql("customer_id", "f") == "${TABLE}.customer_id"
-
-    def test_computed_expression_verbatim_with_warning(self):
-        with pytest.warns(UserWarning, match="computed expression"):
-            assert _to_lookml_sql("LOWER(email)", "f") == "LOWER(email)"
-
-
-# ---------------------------------------------------------------------------
-# Field / dimension classification
+# Fields -> dimensions / dimension_groups
 # ---------------------------------------------------------------------------
 
 class TestFields:
+    def _view(self, *fields, **dataset_kwargs):
+        out = _convert(_model([_dataset("t", list(fields), **dataset_kwargs)]))
+        return _block(out, "view: t")
+
+    def test_plain_field_becomes_string_dimension_when_untyped(self):
+        view = self._view(_field("customer_id", is_time=False))
+        dim = _block(view, "dimension: customer_id")
+        assert "type: string" in dim
+        assert "sql: ${TABLE}.customer_id ;;" in dim
+
     def test_time_field_becomes_dimension_group(self):
-        field = {
-            "name": "order_date",
-            "expression": {"dialects": [{"dialect": "ANSI_SQL", "expression": "order_date"}]},
-            "dimension": {"is_time": True},
-        }
-        block = _convert_field(field)
-        assert block.startswith("dimension_group: order {")
-        assert "type: time" in block
-        assert "timeframes:" in block
+        view = self._view(_field("order_date", is_time=True))
+        group = _block(view, "dimension_group: order")
+        assert "type: time" in group
+        assert "timeframes: [raw, time, date, week, month, quarter, year]" in group
+        assert "sql: ${TABLE}.order_date ;;" in group
+        assert "datatype:" not in group
 
-    def test_plain_field_becomes_dimension(self):
-        field = {
-            "name": "customer_id",
-            "expression": {"dialects": [{"dialect": "ANSI_SQL", "expression": "customer_id"}]},
-            "dimension": {"is_time": False},
-        }
-        block = _convert_field(field)
-        assert block.startswith("dimension: customer_id {")
-        assert "${TABLE}.customer_id" in block
-
-    def test_is_time_dimension_helper(self):
-        assert _is_time_dimension({"dimension": {"is_time": True}}) is True
-        assert _is_time_dimension({"dimension": {"is_time": False}}) is False
-        assert _is_time_dimension({}) is False
+    def test_is_time_without_datatype_warns(self):
+        model = _model([_dataset("t", [_field("order_date", is_time=True)])])
+        with pytest.warns(UserWarning, match="Field 't.order_date'.*is_time without a datatype"):
+            convert_ossie_to_lookml(model)
 
     def test_strip_time_suffix(self):
         assert _strip_time_suffix("order_date") == "order"
         assert _strip_time_suffix("created_timestamp") == "created"
         assert _strip_time_suffix("revenue") == "revenue"
 
+    def test_dimension_group_keeps_name_on_collision(self):
+        # Both would strip to `ship`; LookML names must be unique, so keep the
+        # original names.
+        view = self._view(_field("ship_date", is_time=True), _field("ship_time", is_time=True))
+        assert "dimension_group: ship_date {" in view
+        assert "dimension_group: ship_time {" in view
+
+    def test_dimension_group_keeps_name_when_it_shadows_a_field(self):
+        view = self._view(_field("created"), _field("created_date", is_time=True))
+        assert "dimension: created {" in view
+        assert "dimension_group: created_date {" in view
+
+    def test_label_and_description_are_emitted(self):
+        view = self._view(_field("id", label="Order ID", description="The order"))
+        dim = _block(view, "dimension: id")
+        assert 'label: "Order ID"' in dim
+        assert 'description: "The order"' in dim
+
+    def test_computed_expression_columns_are_qualified(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            out = convert_ossie_to_lookml(
+                _model([_dataset("t", [_field("email_norm", expr="LOWER(email)")])])
+            )
+        assert "sql: LOWER(${TABLE}.email) ;;" in out
+
+    def test_bigquery_functions_survive_qualification(self):
+        out = self._view(
+            _field("month", expr="DATE_TRUNC(order_date, MONTH)"),
+            _field("email", expr="SAFE_CAST(LOWER(email) AS STRING)"),
+        )
+        assert "sql: DATE_TRUNC(${TABLE}.order_date, MONTH) ;;" in out
+        assert "sql: SAFE_CAST(LOWER(${TABLE}.email) AS STRING) ;;" in out
+
+    def test_unparseable_expression_is_verbatim_with_warning(self):
+        model = _model([_dataset("t", [_field("weird", expr="SELECT FROM WHERE ((")])])
+        with pytest.warns(UserWarning, match="Field 't.weird'.*verbatim"):
+            out = convert_ossie_to_lookml(model)
+        assert "sql: SELECT FROM WHERE (( ;;" in out
+
+
+class TestDatatypes:
+    def _dim(self, **field_kwargs):
+        out = _convert(_model([_dataset("t", [_field("f", **field_kwargs)])]))
+        return _block(out, "view: t")
+
+    @pytest.mark.parametrize(
+        "datatype, lookml_type",
+        [
+            ("String", "string"),
+            ("Integer", "number"),
+            ("Decimal", "number"),
+            ("Float", "number"),
+            ("Boolean", "yesno"),
+            ("Time", "string"),
+        ],
+    )
+    def test_scalar_datatypes(self, datatype, lookml_type):
+        view = self._dim(datatype=datatype)
+        assert f"type: {lookml_type}" in _block(view, "dimension: f")
+
+    @pytest.mark.parametrize(
+        "datatype, lookml_datatype, has_time_frame",
+        [
+            ("Date", "date", False),
+            ("DateTime", "datetime", True),
+            ("DateTimeTz", "timestamp", True),
+        ],
+    )
+    def test_temporal_datatypes_become_dimension_groups(self, datatype, lookml_datatype, has_time_frame):
+        view = self._dim(datatype=datatype)
+        group = _block(view, "dimension_group: f")
+        assert "type: time" in group
+        assert f"datatype: {lookml_datatype}" in group
+        assert ("time," in group) is has_time_frame
+
+    def test_is_time_with_non_temporal_datatype_stays_a_dimension(self):
+        # TPC-DS marks `d_year` (Integer) as is_time; a time dimension_group
+        # over an integer column would not load in Looker.
+        view = self._dim(is_time=True, datatype="Integer")
+        assert "dimension_group:" not in view
+        assert "type: number" in _block(view, "dimension: f")
+
+    def test_opaque_datatype_warns_and_defaults_to_string(self):
+        with pytest.warns(UserWarning, match="Opaque"):
+            out = convert_ossie_to_lookml(_model([_dataset("t", [_field("f", datatype="Opaque")])]))
+        assert "type: string" in _block(out, "dimension: f")
+
+    def test_unknown_datatype_warns_and_defaults_to_string(self):
+        with pytest.warns(UserWarning, match="unrecognized"):
+            out = convert_ossie_to_lookml(_model([_dataset("t", [_field("f", datatype="Blob")])]))
+        assert "type: string" in _block(out, "dimension: f")
+
+
+class TestPrimaryKey:
+    def test_single_column_key_marks_the_dimension(self):
+        out = _convert(_model([ORDERS]))
+        assert "primary_key: yes" in _block(out, "dimension: order_id")
+        assert "dimension: primary_key" not in out
+
+    def test_composite_key_becomes_hidden_concat_dimension(self):
+        ds = _dataset("t", [_field("a"), _field("b")], primary_key=["a", "b"])
+        out = _convert(_model([ds]))
+        pk = _block(out, "dimension: primary_key")
+        assert "primary_key: yes" in pk
+        assert "hidden: yes" in pk
+        assert "type: string" in pk
+        assert "sql: CONCAT(CAST(${TABLE}.a AS STRING), '|', CAST(${TABLE}.b AS STRING)) ;;" in pk
+
+    def test_time_column_key_becomes_hidden_dimension(self):
+        # A dimension_group cannot carry primary_key, so fall back to a hidden
+        # dimension over the raw column.
+        ds = _dataset("t", [_field("created_at", is_time=True)], primary_key=["created_at"])
+        out = _convert(_model([ds]))
+        pk = _block(out, "dimension: primary_key")
+        assert "sql: CAST(${TABLE}.created_at AS STRING) ;;" in pk
+
+    def test_join_target_without_key_warns(self):
+        customers = _dataset("customers", [_field("id")])
+        model = _model([ORDERS, customers], [_rel("o2c", "orders", "customers", ["customer_id"], ["id"])])
+        with pytest.warns(UserWarning, match="customers.*no primary_key"):
+            convert_ossie_to_lookml(model)
+
 
 # ---------------------------------------------------------------------------
-# Metrics
+# Metrics -> measures
 # ---------------------------------------------------------------------------
 
 class TestMetrics:
-    def test_metric_becomes_measure(self):
-        metric = {
-            "name": "total_revenue",
-            "expression": {"dialects": [{"dialect": "ANSI_SQL", "expression": "SUM(orders.amount)"}]},
-            "description": "Total revenue",
-        }
-        block = _convert_metric(metric)
-        assert block.startswith("measure: total_revenue {")
-        assert "sql: SUM(orders.amount) ;;" in block
-        assert 'description: "Total revenue"' in block
+    def test_qualified_sum_becomes_typed_measure_in_its_dataset(self):
+        model = _model(
+            [CUSTOMERS, ORDERS],
+            metrics=[_metric("total_revenue", "SUM(orders.amount)", description="Total revenue")],
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            out = convert_ossie_to_lookml(model)
+        measure = _block(_block(out, "view: orders"), "measure: total_revenue")
+        assert "type: sum" in measure
+        assert "sql: ${orders.amount} ;;" in measure
+        assert 'description: "Total revenue"' in measure
+        assert "measure:" not in _block(out, "view: customers")
+
+    @pytest.mark.parametrize(
+        "expr, lookml_type, sql",
+        [
+            ("AVG(orders.amount)", "average", "${orders.amount}"),
+            ("MIN(orders.amount)", "min", "${orders.amount}"),
+            ("MAX(orders.amount)", "max", "${orders.amount}"),
+            ("COUNT(DISTINCT orders.customer_id)", "count_distinct", "${orders.customer_id}"),
+        ],
+    )
+    def test_single_column_aggregates_map_to_native_types(self, expr, lookml_type, sql):
+        out = _convert(_model([ORDERS], metrics=[_metric("m", expr)]))
+        measure = _block(out, "measure: m")
+        assert f"type: {lookml_type}" in measure
+        assert f"sql: {sql} ;;" in measure
+
+    def test_count_star_becomes_count_without_sql(self):
+        out = _convert(_model([ORDERS], metrics=[_metric("n", "COUNT(*)")]))
+        measure = _block(out, "measure: n")
+        assert "type: count" in measure
+        assert "sql:" not in measure
+
+    def test_complex_expression_hoists_aggregates_into_hidden_measures(self):
+        # Looker's symmetric aggregates only protect native typed measures, so
+        # each aggregate becomes a hidden helper and the metric is arithmetic.
+        expr = "SUM(orders.amount) / NULLIF(COUNT(DISTINCT orders.order_id), 0)"
+        out = _convert(_model([ORDERS], metrics=[_metric("aov", expr)]))
+        measure = _block(out, "measure: aov")
+        assert "type: number" in measure
+        assert "sql: ${aov_sum_1} / NULLIF(${aov_count_distinct_2}, 0) ;;" in measure
+        helper = _block(out, "measure: aov_sum_1")
+        assert "hidden: yes" in helper
+        assert "type: sum" in helper
+        assert "sql: ${orders.amount} ;;" in helper
+        helper = _block(out, "measure: aov_count_distinct_2")
+        assert "type: count_distinct" in helper
+        assert "sql: ${orders.order_id} ;;" in helper
+
+    def test_aggregate_over_row_expression_is_native(self):
+        out = _convert(_model([ORDERS], metrics=[_metric("gross", "SUM(orders.amount * 1.1)")]))
+        measure = _block(out, "measure: gross")
+        assert "type: sum" in measure
+        assert "sql: ${orders.amount} * 1.1 ;;" in measure
+
+    def test_untypeable_aggregate_stays_inline_with_warning(self):
+        model = _model([ORDERS], metrics=[_metric("n", "COUNT(orders.amount)")])
+        with pytest.warns(UserWarning, match="Metric 'n'.*cannot type natively"):
+            out = convert_ossie_to_lookml(model)
+        measure = _block(out, "measure: n")
+        assert "type: number" in measure
+        assert "sql: COUNT(${orders.amount}) ;;" in measure
+
+    def test_window_function_warns_and_stays_inline(self):
+        expr = "SUM(SUM(orders.amount)) OVER (ORDER BY orders.order_id)"
+        with pytest.warns(UserWarning, match="Metric 'running'.*window"):
+            out = convert_ossie_to_lookml(_model([ORDERS], metrics=[_metric("running", expr)]))
+        measure = _block(out, "measure: running")
+        assert "type: number" in measure
+        assert "SUM(SUM(${orders.amount})) OVER (ORDER BY ${orders.order_id}" in measure
+
+    def test_unqualified_column_homes_in_its_only_owner(self):
+        out = _convert(_model([CUSTOMERS, ORDERS], metrics=[_metric("rev", "SUM(amount)")]))
+        measure = _block(_block(out, "view: orders"), "measure: rev")
+        assert "sql: ${TABLE}.amount ;;" in measure
+
+    def test_ambiguous_unqualified_column_warns_and_uses_first_dataset(self):
+        model = _model([CUSTOMERS, REGIONS], metrics=[_metric("ids", "COUNT(DISTINCT id)")])
+        with pytest.warns(UserWarning, match="Metric 'ids'.*several datasets.*'customers'"):
+            out = convert_ossie_to_lookml(model)
+        assert "measure: ids" in _block(out, "view: customers")
+
+    def test_unknown_unqualified_column_warns(self):
+        model = _model([CUSTOMERS, ORDERS], metrics=[_metric("t", "SUM(tax)")])
+        with pytest.warns(UserWarning, match="Metric 't'.*no dataset exposes.*'tax'"):
+            convert_ossie_to_lookml(model)
+
+    def test_qualified_unknown_field_falls_back_to_physical_column_with_warning(self):
+        model = _model([ORDERS], metrics=[_metric("t", "SUM(orders.tax)")])
+        with pytest.warns(UserWarning, match="Metric 't'.*'orders.tax'"):
+            out = convert_ossie_to_lookml(model)
+        assert "sql: ${TABLE}.tax ;;" in _block(out, "measure: t")
+
+    def test_cross_dataset_metric_warns_per_metric(self):
+        expr = "SUM(orders.amount) / COUNT(DISTINCT customers.id)"
+        model = _model([CUSTOMERS, ORDERS], metrics=[_metric("rpc", expr)])
+        with pytest.warns(UserWarning, match="Metric 'rpc'.*customers"):
+            out = convert_ossie_to_lookml(model)
+        measure = _block(_block(out, "view: orders"), "measure: rpc")
+        assert "sql: ${rpc_sum_1} / ${rpc_count_distinct_2} ;;" in measure
+        assert "sql: ${customers.id} ;;" in _block(out, "measure: rpc_count_distinct_2")
+
+    def test_unparseable_metric_is_verbatim_with_warning(self):
+        model = _model([ORDERS], metrics=[_metric("bad", "SUM((")])
+        with pytest.warns(UserWarning, match="Metric 'bad'.*verbatim"):
+            out = convert_ossie_to_lookml(model)
+        assert "sql: SUM(( ;;" in _block(out, "measure: bad")
 
 
 # ---------------------------------------------------------------------------
@@ -234,104 +510,231 @@ class TestMetrics:
 
 class TestRelationships:
     def test_simple_join(self):
-        rels = [
-            {
-                "name": "orders_to_customers",
-                "from": "orders",
-                "to": "customers",
-                "from_columns": ["customer_id"],
-                "to_columns": ["id"],
-            }
-        ]
-        out = _convert_relationships(rels, [{"name": "orders"}, {"name": "customers"}])
-        assert "explore: orders {" in out
-        assert "join: customers {" in out
-        assert "sql_on: ${orders.customer_id} = ${customers.id} ;;" in out
-        assert "relationship: many_to_one" in out
+        out = _convert(_model([ORDERS, CUSTOMERS], [_rel("o2c", "orders", "customers", ["customer_id"], ["id"])]))
+        join = _block(_block(out, "explore: orders"), "join: customers")
+        assert "from:" not in join
+        assert "type: left_outer" in join
+        assert "relationship: many_to_one" in join
+        assert "sql_on: ${orders.customer_id} = ${customers.id} ;;" in join
 
     def test_composite_join_uses_and(self):
-        rels = [
-            {
-                "name": "lines_to_products",
-                "from": "order_lines",
-                "to": "products",
-                "from_columns": ["product_id", "variant_id"],
-                "to_columns": ["id", "variant_id"],
-            }
-        ]
-        out = _convert_relationships(rels, [{"name": "order_lines"}, {"name": "products"}])
-        assert (
-            "sql_on: ${order_lines.product_id} = ${products.id} AND "
-            "${order_lines.variant_id} = ${products.variant_id} ;;"
-        ) in out
+        a = _dataset("a", [_field("x"), _field("y")], primary_key=["x", "y"])
+        b = _dataset("b", [_field("x"), _field("y")], primary_key=["x", "y"])
+        out = _convert(_model([a, b], [_rel("a2b", "a", "b", ["x", "y"], ["x", "y"])]))
+        assert "sql_on: ${a.x} = ${b.x} AND ${a.y} = ${b.y} ;;" in out
 
     def test_mismatched_columns_raise(self):
-        rels = [
-            {
-                "name": "bad",
-                "from": "a",
-                "to": "b",
-                "from_columns": ["x"],
-                "to_columns": ["y", "z"],
-            }
-        ]
+        model = _model([ORDERS, CUSTOMERS], [_rel("o2c", "orders", "customers", ["customer_id", "x"], ["id"])])
         with pytest.raises(OssieConversionError, match="same length"):
-            _convert_relationships(rels, [{"name": "a"}, {"name": "b"}])
+            convert_ossie_to_lookml(model)
+
+    @pytest.mark.parametrize("from_cols, to_cols", [(None, ["id"]), ([], ["id"]), (["customer_id"], None)])
+    def test_missing_or_empty_columns_raise_conversion_error(self, from_cols, to_cols):
+        model = _model([ORDERS, CUSTOMERS], [_rel("o2c", "orders", "customers", from_cols, to_cols)])
+        with pytest.raises(OssieConversionError, match="Relationship 'o2c'"):
+            convert_ossie_to_lookml(model)
+
+    def test_two_relationships_to_same_dataset_are_aliased(self):
+        orders = _dataset("orders", [_field("id"), _field("billing_addr"), _field("shipping_addr")], primary_key=["id"])
+        addresses = _dataset("addresses", [_field("id")], primary_key=["id"])
+        model = _model(
+            [orders, addresses],
+            [
+                _rel("billing_address", "orders", "addresses", ["billing_addr"], ["id"]),
+                _rel("shipping_address", "orders", "addresses", ["shipping_addr"], ["id"]),
+            ],
+        )
+        out = _convert(model)
+        explore = _block(out, "explore: orders")
+        assert "join: addresses {" not in explore
+        billing = _block(explore, "join: billing_address")
+        assert "from: addresses" in billing
+        assert "sql_on: ${orders.billing_addr} = ${billing_address.id} ;;" in billing
+        shipping = _block(explore, "join: shipping_address")
+        assert "from: addresses" in shipping
+        assert "sql_on: ${orders.shipping_addr} = ${shipping_address.id} ;;" in shipping
+        assert lkml.load(out)["explores"][0]["joins"][0]["from"] == "addresses"
+
+    def test_alias_must_be_a_valid_lookml_name(self):
+        orders = _dataset("orders", [_field("a"), _field("b")])
+        addresses = _dataset("addresses", [_field("id")], primary_key=["id"])
+        model = _model(
+            [orders, addresses],
+            [
+                _rel("billing address", "orders", "addresses", ["a"], ["id"]),
+                _rel("shipping-address", "orders", "addresses", ["b"], ["id"]),
+            ],
+        )
+        with pytest.raises(OssieConversionError, match="'billing address'.*LookML"):
+            convert_ossie_to_lookml(model)
+
+    def test_chain_is_joined_transitively(self):
+        model = _model(
+            [ORDERS, CUSTOMERS, REGIONS],
+            [
+                _rel("o2c", "orders", "customers", ["customer_id"], ["id"]),
+                _rel("c2r", "customers", "regions", ["region_id"], ["id"]),
+            ],
+        )
+        out = _convert(model)
+        orders = _block(out, "explore: orders")
+        assert "sql_on: ${orders.customer_id} = ${customers.id} ;;" in _block(orders, "join: customers")
+        assert "sql_on: ${customers.region_id} = ${regions.id} ;;" in _block(orders, "join: regions")
+        customers = _block(out, "explore: customers")
+        assert "join: regions {" in customers
+        assert "explore: regions" not in out
+
+    def test_transitive_join_through_alias_uses_the_alias(self):
+        orders = _dataset("orders", [_field("id"), _field("bill_id"), _field("ship_id")], primary_key=["id"])
+        addresses = _dataset("addresses", [_field("id"), _field("region_id")], primary_key=["id"])
+        model = _model(
+            [orders, addresses, REGIONS],
+            [
+                _rel("billing", "orders", "addresses", ["bill_id"], ["id"]),
+                _rel("shipping", "orders", "addresses", ["ship_id"], ["id"]),
+                _rel("a2r", "addresses", "regions", ["region_id"], ["id"]),
+            ],
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            out = convert_ossie_to_lookml(model)
+        explore = _block(out, "explore: orders")
+        # Each aliased path keeps its own copy of the downstream view.
+        billing_regions = _block(explore, "join: billing_regions")
+        assert "from: regions" in billing_regions
+        assert "sql_on: ${billing.region_id} = ${billing_regions.id} ;;" in billing_regions
+        assert "sql_on: ${shipping.region_id} = ${shipping_regions.id} ;;" in _block(explore, "join: shipping_regions")
+        assert "join: regions {" not in explore
+
+    def test_diamond_joins_the_shared_target_once_with_warning(self):
+        stores = _dataset("stores", [_field("id"), _field("region_id")], primary_key=["id"])
+        orders = _dataset("orders", [_field("id"), _field("customer_id"), _field("store_id")], primary_key=["id"])
+        model = _model(
+            [orders, CUSTOMERS, stores, REGIONS],
+            [
+                _rel("o2c", "orders", "customers", ["customer_id"], ["id"]),
+                _rel("o2s", "orders", "stores", ["store_id"], ["id"]),
+                _rel("c2r", "customers", "regions", ["region_id"], ["id"]),
+                _rel("s2r", "stores", "regions", ["region_id"], ["id"]),
+            ],
+        )
+        with pytest.warns(UserWarning, match="Relationship 's2r'.*'regions' is already joined"):
+            out = convert_ossie_to_lookml(model)
+        explore = _block(out, "explore: orders")
+        assert explore.count("join: regions {") == 1
+        assert "sql_on: ${customers.region_id} = ${regions.id} ;;" in explore
+
+    def test_cycle_terminates_with_warning(self):
+        a = _dataset("a", [_field("id"), _field("b_id")], primary_key=["id"])
+        b = _dataset("b", [_field("id"), _field("a_id")], primary_key=["id"])
+        model = _model([a, b], [_rel("a2b", "a", "b", ["b_id"], ["id"]), _rel("b2a", "b", "a", ["a_id"], ["id"])])
+        with pytest.warns(UserWarning, match="Relationship 'b2a'.*cycle"):
+            out = convert_ossie_to_lookml(model)
+        assert _block(_block(out, "explore: a"), "join: b")
+        assert "join: a {" not in _block(out, "explore: a")
+
+    def test_sql_on_uses_raw_timeframe_for_dimension_groups(self):
+        events = _dataset("events", [_field("id"), _field("created_timestamp", is_time=True)], primary_key=["id"])
+        days = _dataset("days", [_field("day_ts", is_time=True)], primary_key=["day_ts"])
+        model = _model([events, days], [_rel("e2d", "events", "days", ["created_timestamp"], ["day_ts"])])
+        out = _convert(model)
+        assert "sql_on: ${events.created_raw} = ${days.day_ts_raw} ;;" in out
+
+    def test_sql_on_resolves_a_column_to_the_field_that_exposes_it(self):
+        orders = _dataset("orders", [_field("id"), _field("cust", expr="customer_id")], primary_key=["id"])
+        model = _model([orders, CUSTOMERS], [_rel("o2c", "orders", "customers", ["customer_id"], ["id"])])
+        out = _convert(model)
+        assert "sql_on: ${orders.cust} = ${customers.id} ;;" in out
+
+    def test_sql_on_unknown_column_warns(self):
+        orders = _dataset("orders", [_field("id")], primary_key=["id"])
+        model = _model([orders, CUSTOMERS], [_rel("o2c", "orders", "customers", ["customer_id"], ["id"])])
+        with pytest.warns(UserWarning, match="Relationship 'o2c'.*'customer_id'.*no field"):
+            out = convert_ossie_to_lookml(model)
+        assert "sql_on: ${orders.customer_id} = ${customers.id} ;;" in out
+
+    def test_unknown_dataset_warns(self):
+        model = _model([ORDERS], [_rel("o2x", "orders", "ghosts", ["customer_id"], ["id"])])
+        with pytest.warns(UserWarning, match="'ghosts' is not defined"):
+            convert_ossie_to_lookml(model)
+
+    def test_relationship_extensions_are_reported_as_dropped(self):
+        rel = _rel("o2c", "orders", "customers", ["customer_id"], ["id"])
+        rel["ai_context"] = {"instructions": "x"}
+        rel["custom_extensions"] = [{"vendor": "X", "attributes": {}}]
+        with pytest.warns(UserWarning, match="relationship 'o2c'") as record:
+            convert_ossie_to_lookml(_model([ORDERS, CUSTOMERS], [rel]))
+        messages = [str(w.message) for w in record if "relationship 'o2c'" in str(w.message)]
+        assert any("ai_context" in m and "custom_extensions" in m for m in messages)
+
+
+class TestExplores:
+    def test_every_unjoined_dataset_gets_a_bare_explore(self):
+        out = _convert(_model([ORDERS, CUSTOMERS]))
+        assert "explore: orders {}" in out
+        assert "explore: customers {}" in out
+
+    def test_join_targets_do_not_get_their_own_explore(self):
+        out = _convert(_model([ORDERS, CUSTOMERS], [_rel("o2c", "orders", "customers", ["customer_id"], ["id"])]))
+        assert "explore: customers" not in out
+
+    def test_output_has_view_and_model_sections(self):
+        out = _convert(_model([ORDERS]))
+        assert out.index("# Views") < out.index("view: orders") < out.index("# Explores") < out.index("explore: orders")
 
 
 # ---------------------------------------------------------------------------
-# _entity_description
+# Descriptions
 # ---------------------------------------------------------------------------
 
 class TestEntityDescription:
     def test_combines_description_and_synonyms(self):
-        out = _entity_description(
-            {"description": "Orders", "ai_context": {"synonyms": ["purchases", "sales"]}}
-        )
-        assert "Orders" in out
-        assert "purchases" in out and "sales" in out
+        entity = {"description": "Orders", "ai_context": {"synonyms": ["purchases", "sales"]}}
+        assert _entity_description(entity) == "Orders (synonyms: purchases, sales)"
 
     def test_string_ai_context_appended(self):
-        out = _entity_description({"description": "Orders", "ai_context": "retail"})
-        assert out == "Orders retail"
+        assert _entity_description({"description": "A", "ai_context": "B"}) == "A B"
 
 
 # ---------------------------------------------------------------------------
-# End-to-end against fixtures
+# End to end
 # ---------------------------------------------------------------------------
 
 class TestEndToEnd:
-    def test_bigquery_fixture_round(self):
-        ossie_yaml = (FIXTURES / "ossie_bigquery_example.yaml").read_text()
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            out = convert_ossie_to_lookml(ossie_yaml)
-        # Views for both datasets.
-        assert "view: orders {" in out
-        assert "view: customers {" in out
-        # Dataset description (plus synonyms) is emitted as a description.
-        assert 'description: "Customer orders (synonyms: purchases, sales)"' in out
-        assert "label:" not in out
-        # BigQuery dialect preferred for the normalized email field.
-        assert "SAFE_CAST(LOWER(email) AS STRING)" in out
-        # Backtick-quoted BigQuery table reference.
-        assert "sql_table_name: `my_project.sales.orders` ;;" in out
-        # Time field -> dimension_group.
-        assert "dimension_group: order {" in out
-        # Metric -> measure, emitted in the first view.
-        assert "measure: total_revenue {" in out
-        # Relationship -> explore/join.
-        assert "explore: orders {" in out
-        assert "join: customers {" in out
+    def test_bigquery_fixture(self):
+        out = _convert((FIXTURES / "ossie_bigquery_example.yaml").read_text())
+        orders = _block(out, "view: orders")
+        assert "sql_table_name: `my_project.sales.orders` ;;" in orders
+        # Looker has no view-level description: it is kept as a comment in the
+        # view and emitted on the explore.
+        assert "# Customer orders (synonyms: purchases, sales)" in orders
+        assert "description:" not in orders.split("dimension:")[0]
+        assert 'description: "Customer orders (synonyms: purchases, sales)"' in _block(out, "explore: orders")
+        assert "primary_key: yes" in _block(orders, "dimension: order_id")
+        assert "type: number" in _block(orders, "dimension: amount")
+        assert "datatype: timestamp" in _block(orders, "dimension_group: order")
+        assert "type: sum" in _block(orders, "measure: total_revenue")
+        assert "sql: SAFE_CAST(LOWER(${TABLE}.email) AS STRING) ;;" in _block(out, "view: customers")
+        join = _block(_block(out, "explore: orders"), "join: customers")
+        assert "sql_on: ${orders.customer_id} = ${customers.id} ;;" in join
 
-    def test_tpcds_example_converts(self):
-        # The repo's canonical example is ANSI_SQL-only; the converter must
-        # handle it with no BigQuery dialect present.
-        tpcds = Path(__file__).resolve().parents[3] / "examples" / "tpcds_semantic_model.yaml"
-        if not tpcds.exists():
-            pytest.skip("TPC-DS example not found")
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            out = convert_ossie_to_lookml(tpcds.read_text())
-        assert "view: store_sales {" in out
-        assert "explore:" in out
+    def test_bigquery_fixture_is_valid_lookml(self):
+        parsed = lkml.load(_convert((FIXTURES / "ossie_bigquery_example.yaml").read_text()))
+        assert {v["name"] for v in parsed["views"]} == {"orders", "customers"}
+        assert [e["name"] for e in parsed["explores"]] == ["orders"]
+
+    @pytest.mark.skipif(not TPCDS.exists(), reason="TPC-DS example not found")
+    def test_tpcds_example_converts_to_valid_lookml(self):
+        out = _convert(TPCDS.read_text())
+        parsed = lkml.load(out)
+        views = {v["name"]: v for v in parsed["views"]}
+        assert "store_sales" in views
+        store_sales = _block(out, "view: store_sales")
+        assert "primary_key: yes" in _block(store_sales, "dimension: primary_key")
+        assert "type: sum" in _block(store_sales, "measure: total_sales")
+        assert "sql: ${store_sales.ss_ext_sales_price} ;;" in _block(store_sales, "measure: total_sales")
+        # d_year is an Integer marked is_time: a number dimension, not a group.
+        assert "type: number" in _block(_block(out, "view: date_dim"), "dimension: d_year")
+        explore = _block(out, "explore: store_sales")
+        for target in ("date_dim", "item", "customer", "store"):
+            assert f"join: {target} {{" in explore

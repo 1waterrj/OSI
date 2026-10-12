@@ -41,6 +41,7 @@ datasets:
             - dialect: ANSI_SQL
               expression: order_id
         description: Order identifier
+        datatype: Integer
         dimension:
           is_time: false
 
@@ -49,6 +50,7 @@ datasets:
           dialects:
             - dialect: ANSI_SQL
               expression: customer_id
+        datatype: Integer
         dimension:
           is_time: false
 
@@ -57,6 +59,7 @@ datasets:
           dialects:
             - dialect: ANSI_SQL
               expression: order_date
+        datatype: DateTimeTz
         dimension:
           is_time: true
 
@@ -65,6 +68,7 @@ datasets:
           dialects:
             - dialect: ANSI_SQL
               expression: amount
+        datatype: Decimal
 
   - name: customers
     source: my_project.sales.customers
@@ -76,6 +80,7 @@ datasets:
           dialects:
             - dialect: ANSI_SQL
               expression: id
+        datatype: Integer
         dimension:
           is_time: false
 
