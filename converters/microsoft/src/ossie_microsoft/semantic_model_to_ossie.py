@@ -42,6 +42,7 @@ from ._common import (
     IDENTIFIER_RE,
     OSSIE_TO_TMSL_DATATYPE,
     OSSIE_VERSION,
+    RELATIONSHIP_ENDPOINT_METADATA,
     TEMPORAL_DATATYPES,
     TMSL_TO_OSSIE_DATATYPE,
     TMSL_UNSUPPORTED_COLUMN,
@@ -51,6 +52,7 @@ from ._common import (
     TMSL_UNTYPED,
     is_date_only_format,
     make_expression,
+    read_stash,
     text,
     warn,
     warn_unsupported,
@@ -66,10 +68,16 @@ _PRESERVED = (
 
 _AI_CONTEXT_ANNOTATION = "OssieAIContext"
 
-# `Schema="dbo", Item="Sales"` navigation in a Power Query (M) partition.
+# `Schema="dbo", Item="Sales"` navigation in a SQL Server Power Query (M) partition.
 _M_ITEM_RE = re.compile(r'Item\s*=\s*"([^"]+)"')
 _M_SCHEMA_RE = re.compile(r'Schema\s*=\s*"([^"]+)"')
 _M_DATABASE_RE = re.compile(r'Sql\.Databases?\s*\(\s*"[^"]*"\s*,\s*"([^"]+)"')
+# `{[Name="base",Kind="View"]}` steps in a Google BigQuery navigator. `Kind` may
+# precede `Name`. A step with no Kind is the project.
+_M_BQ_STEP_RE = re.compile(r"\{\[([^\]]*)\]\}")
+_M_BQ_NAME_RE = re.compile(r'Name\s*=\s*"([^"]+)"')
+_M_BQ_KIND_RE = re.compile(r'Kind\s*=\s*"([^"]+)"')
+_BQ_TABLE_KINDS = frozenset({"View", "Table"})
 
 # TMSL properties consumed by the Apache Ossie mapping at each level. Everything else is
 # preserved verbatim in the stash. This is deliberately a deny-list rather than an
@@ -94,8 +102,6 @@ _RELATIONSHIP_CONSUMED = frozenset(
         "isActive",
     }
 )
-
-
 def convert_semantic_model_to_ossie(semantic_model: dict | str) -> str:
     """Convert a Power BI semantic model into an Apache Ossie semantic model.
 
@@ -169,7 +175,9 @@ def build_ossie_document(bim_file):
     if relationships:
         semantic_model["relationships"] = relationships
 
-    metrics, excluded_measures = _convert_metrics(tables)
+    metric_tables = [table for table in all_tables if _is_measure_table(table)]
+    metrics, excluded_measures = _convert_metrics(metric_tables)
+    excluded_tables = _strip_converted_measures(excluded_tables, metrics)
     if metrics:
         semantic_model["metrics"] = metrics
 
@@ -227,6 +235,20 @@ def _is_calculated_table(table):
         and isinstance(partition.get("source"), dict)
         and partition["source"].get("type") == "calculated"
         for partition in table.get("partitions") or []
+    )
+
+
+def _is_measure_table(table):
+    """Whether measures on a table can become model-level Apache Ossie metrics."""
+    if _is_exported_table(table):
+        return True
+    # Calculated tables have no portable dataset source, but their measures are still
+    # model-level metrics and can be restored to the original table from the stash.
+    return (
+        _is_calculated_table(table)
+        and not table.get("isPrivate")
+        and not table.get("calculationGroup")
+        and not AUTO_DATE_TABLE_RE.match(table["name"])
     )
 
 
@@ -304,7 +326,7 @@ def _table_source(table):
     return table["name"]
 
 
-def _qualified_name_from_m(expression):
+def _qualified_name_from_sql_server_m(expression):
     item = _M_ITEM_RE.search(expression)
     if not item:
         return None
@@ -316,6 +338,55 @@ def _qualified_name_from_m(expression):
         if database:
             parts.insert(0, database.group(1))
     return ".".join(parts)
+
+
+def _qualified_name_from_bigquery_m(expression):
+    """Read project.dataset.table from a Google BigQuery navigator.
+
+    A missing outer part is left off, matching the SQL Server path: dataset and
+    view become ``dataset.view``, and a project is included only when both of
+    those are present. Without a view or table there is no physical relation.
+    """
+    if "GoogleBigQuery.Database" not in expression:
+        return None
+    project = dataset = table = None
+    for step in _M_BQ_STEP_RE.finditer(expression):
+        name_match = _M_BQ_NAME_RE.search(step.group(1))
+        if name_match is None:
+            continue
+        name = name_match.group(1)
+        kind_match = _M_BQ_KIND_RE.search(step.group(1))
+        kind = kind_match.group(1) if kind_match else None
+        if kind == "Schema":
+            dataset = name
+        elif kind in _BQ_TABLE_KINDS:
+            table = name
+        elif kind is None and project is None:
+            project = name
+    if table is None:
+        return None
+    parts = [table]
+    if dataset:
+        parts.insert(0, dataset)
+        if project:
+            parts.insert(0, project)
+    return ".".join(parts)
+
+
+# Each parser returns a qualified name, or None when the M expression is not
+# that warehouse. Another warehouse is another function in this tuple.
+_M_SOURCE_PARSERS = (
+    _qualified_name_from_sql_server_m,
+    _qualified_name_from_bigquery_m,
+)
+
+
+def _qualified_name_from_m(expression):
+    for parser in _M_SOURCE_PARSERS:
+        qualified = parser(expression)
+        if qualified:
+            return qualified
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -332,7 +403,7 @@ def _convert_column(column, table_scope):
     if column.get("type") == "calculated":
         # A calculated column is DAX. It is carried across as DAX rather than rewritten
         # into SQL, so no expression semantics are invented.
-        expression = make_expression(text(column.get("expression", "")).strip(), DIALECT_DAX)
+        expression = make_expression(text(column.get("expression", "")), DIALECT_DAX)
     else:
         expression = make_expression(column.get("sourceColumn") or name, DIALECT_ANSI)
 
@@ -346,6 +417,9 @@ def _convert_column(column, table_scope):
     ai_context, stash = _split_ai_context(column, _COLUMN_CONSUMED)
     if ai_context is not None:
         field["ai_context"] = ai_context
+    for key in ("isKey", "isUnique"):
+        if column.get(key) is False:
+            stash[key] = False
     if datatype in TEMPORAL_DATATYPES or column.get("dataCategory") == "Time":
         field["dimension"] = {"is_time": True}
 
@@ -420,11 +494,11 @@ def _convert_metrics(tables):
             warn_unsupported(scope, measure, TMSL_UNSUPPORTED_MEASURE, "Apache Ossie", _PRESERVED)
             original_expression = measure.get("expression")
             expression = (
-                text(original_expression).strip()
+                text(original_expression)
                 if original_expression is not None
                 else ""
             )
-            if not expression:
+            if not expression.strip():
                 warn(
                     scope,
                     "measure has no expression; excluded from the Apache Ossie model "
@@ -466,6 +540,44 @@ def _convert_metrics(tables):
             write_stash(metric, stash)
             metrics.append(metric)
     return metrics, excluded
+
+
+def _strip_converted_measures(excluded_tables, metrics):
+    """Keep converted metrics out of the table stash to avoid restoring them twice."""
+    converted = set()
+    for metric in metrics:
+        stash = read_stash(metric)
+        table_name = stash.get("table")
+        measure_name = stash.get("name", metric.get("name"))
+        if table_name and measure_name:
+            converted.add((table_name.casefold(), measure_name.casefold()))
+
+    if not converted:
+        return excluded_tables
+
+    result = []
+    for table in excluded_tables:
+        measures = table.get("measures")
+        if not isinstance(measures, list):
+            result.append(table)
+            continue
+        remaining = [
+            measure
+            for measure in measures
+            if not isinstance(measure, dict)
+            or not measure.get("name")
+            or (table["name"].casefold(), measure["name"].casefold()) not in converted
+        ]
+        if len(remaining) == len(measures):
+            result.append(table)
+            continue
+        preserved = dict(table)
+        if remaining:
+            preserved["measures"] = remaining
+        else:
+            preserved.pop("measures", None)
+        result.append(preserved)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -544,13 +656,17 @@ def _convert_relationships(relationships, exported_names):
         for key in ("fromCardinality", "toCardinality"):
             if key in relationship:
                 stash[key] = relationship[key]
+        if "isActive" in relationship:
+            # Inactive relationships are excluded above. Preserve an explicitly active
+            # value so an otherwise lossless Power BI round trip does not omit it.
+            stash["isActive"] = relationship["isActive"]
         if flipped:
             # Recorded so an export restores the original one-to-many orientation
             # instead of silently rewriting the model shape.
             stash["flipped"] = True
-        if flipped or any(key in relationship for key in ("fromCardinality", "toCardinality")):
-            # Cardinality and orientation only describe these normalized endpoints.
-            # Remember them so later Ossie edits cannot make that metadata stale.
+        if flipped or any(key in relationship for key in RELATIONSHIP_ENDPOINT_METADATA):
+            # These properties describe this specific relationship. Remember its
+            # normalized endpoints so later Ossie edits cannot replay stale metadata.
             stash["normalizedEndpoints"] = [
                 from_table,
                 from_column,
