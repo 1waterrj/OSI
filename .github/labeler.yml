@@ -81,6 +81,10 @@ converter/holistics:
   - changed-files:
       - any-glob-to-any-file: 'converters/holistics/**'
 
+converter/bigquery:
+  - changed-files:
+      - any-glob-to-any-file: 'converters/bigquery/**'
+
 # Other areas
 cli:
   - changed-files:
